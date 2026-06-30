@@ -8,14 +8,17 @@ import type { AppContext } from "./env";
 /**
  * 访问控制中间件。
  *
- * MVP 采用「应用令牌」方案：部署者通过 `wrangler secret put APP_TOKEN`
- * 设置随机令牌，前端在请求头携带 `Authorization: Bearer <token>`。
- * 主密码本身永不上传，仅用于浏览器端派生加密密钥（Zero Knowledge）。
- *
- * 生产环境强烈建议叠加 Cloudflare Access 做身份层防护。
+ * 鉴权策略：
+ *  - vault 未初始化（KV 无 vault:setup）→ 必须 APP_TOKEN（保护首次 setup 流程）
+ *  - vault 已初始化                  → 跳过 APP_TOKEN 校验（用户已用主密码自证身份，
+ *                                       所有 entry 仍加密，零知识不破）
+ *  - AI 读取端点 /api/ai/fetch、/api/ai/share 始终使用独立 Token（见 routes/ai.ts）
+ *  - /api/vault/config 也加入白名单（让前端无需 token 就能查 setup 状态决定 UI）
  */
+const VAULT_SETUP_KEY = "vault:setup";
+
 export const authMiddleware = createMiddleware<AppContext>(async (c, next) => {
-  // AI 读取端点使用独立的临时 Token 鉴权（见 routes/ai.ts），不走 APP_TOKEN
+  // 1. AI 读取端点放行
   if (
     c.req.path.startsWith("/api/ai/fetch") ||
     (c.req.method === "GET" && c.req.path.startsWith("/api/ai/share/"))
@@ -23,6 +26,24 @@ export const authMiddleware = createMiddleware<AppContext>(async (c, next) => {
     await next();
     return;
   }
+
+  // 2. config / setup 接口放行（首次初始化流程不要求 Token）
+  if (
+    c.req.path === "/api/vault/config" ||
+    c.req.path === "/api/vault/setup"
+  ) {
+    await next();
+    return;
+  }
+
+  // 3. vault 已初始化 → 跳过 App Token 校验
+  const setup = await c.env.KV.get(VAULT_SETUP_KEY);
+  if (setup) {
+    await next();
+    return;
+  }
+
+  // 4. vault 未初始化 → 必须 App Token
   const auth = c.req.header("Authorization") ?? "";
   if (!auth.startsWith("Bearer ")) {
     return c.json({ ok: false, error: "未授权：缺少 Bearer 令牌" }, 401);

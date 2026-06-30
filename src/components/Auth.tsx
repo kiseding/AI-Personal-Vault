@@ -2,10 +2,13 @@
  * 认证组件：首次设置主密码 / 解锁（第四章 Zero Knowledge）
  *
  * 流程：
- *  1. 输入 App Token（部署时设置）→ 加载保险库配置（salt + verifier）
+ *  1. 加载 vault 配置（公开接口，无需 App Token）
  *  2a. 若未初始化 → 设置主密码：本地派生密钥，生成 salt + verifier，上传
  *  2b. 若已初始化 → 输入主密码：本地派生密钥，用 verifier 自检
  *  3. 主密钥仅存内存，解锁成功
+ *
+ * App Token 仅在 vault 未初始化时由中间件强制要求；初始化完成后
+ * 所有接口均跳过 App Token 校验（用户已用主密码自证身份）。
  */
 import { useEffect, useState } from "react";
 import { api, type VaultConfig } from "../lib/api";
@@ -18,50 +21,37 @@ import {
 } from "@/web/crypto";
 
 export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
-  const [appToken, setAppTokenState] = useState("");
+  const [config, setConfig] = useState<VaultConfig | null>(null);
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
-  const [config, setConfig] = useState<VaultConfig | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const needsToken = !sessionStorage.getItem("vault_app_token");
-
-  const loadConfig = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const c = await api.vaultConfig();
-      setConfig(c);
-      if (c.setup && c.salt && c.verifier) {
-        session.setConfig(c.salt, c.verifier);
-      }
-    } catch (e) {
-      sessionStorage.removeItem("vault_app_token");
-      setError((e as Error).message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleConnect = async () => {
-    if (!appToken.trim()) return setError("请输入应用令牌");
-    sessionStorage.setItem("vault_app_token", appToken.trim());
-    await loadConfig();
-  };
-
+  // 启动时立即拉 vault config（接口在白名单，无需 App Token）
   useEffect(() => {
-    if (!needsToken) {
-      void loadConfig();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    void (async () => {
+      try {
+        const c = await api.vaultConfig();
+        setConfig(c);
+        if (c.setup && c.salt && c.verifier) {
+          session.setConfig(c.salt, c.verifier);
+        }
+      } catch (e) {
+        setError((e as Error).message);
+      } finally {
+        setLoading(false);
+      }
+    })();
   }, []);
+
+  const isSetup = config?.setup === true;
 
   const handleSetup = async () => {
     setError(null);
     if (password.length < 8) return setError("主密码至少 8 位");
     if (password !== confirm) return setError("两次输入不一致");
-    setLoading(true);
+    setBusy(true);
     try {
       const salt = generateSalt();
       const key = await deriveMasterKey(password, salt);
@@ -73,13 +63,13 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
 
   const handleUnlock = async () => {
     setError(null);
-    setLoading(true);
+    setBusy(true);
     try {
       const key = await verifyPassword(
         password,
@@ -95,11 +85,9 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   };
-
-  const isSetup = config?.setup === true;
 
   return (
     <div className="min-h-screen flex items-center justify-center px-5">
@@ -108,8 +96,8 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
           <div className="text-4xl">🔐</div>
           <h1 className="text-xl font-semibold">AI Personal Vault</h1>
           <p className="text-sm text-ink-400">
-            {needsToken
-              ? "输入应用访问令牌"
+            {loading
+              ? "加载中…"
               : isSetup
                 ? "输入主密码解锁"
                 : "创建你的保险库主密码"}
@@ -122,20 +110,7 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
           </div>
         )}
 
-        {needsToken ? (
-          <>
-            <Field
-              label="应用令牌 (App Token)"
-              type="password"
-              value={appToken}
-              onChange={setAppTokenState}
-              placeholder="部署时设置的 APP_TOKEN"
-            />
-            <Button onClick={handleConnect} loading={loading}>
-              连接
-            </Button>
-          </>
-        ) : isSetup ? (
+        {!loading && isSetup && (
           <>
             <Field
               label="主密码"
@@ -144,12 +119,15 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
               onChange={setPassword}
               placeholder="••••••••"
               autoFocus
+              onSubmit={handleUnlock}
             />
-            <Button onClick={handleUnlock} loading={loading}>
+            <Button onClick={handleUnlock} loading={busy}>
               解锁
             </Button>
           </>
-        ) : (
+        )}
+
+        {!loading && !isSetup && (
           <>
             <Field
               label="设置主密码"
@@ -165,8 +143,9 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
               value={confirm}
               onChange={setConfirm}
               placeholder="再次输入"
+              onSubmit={handleSetup}
             />
-            <Button onClick={handleSetup} loading={loading}>
+            <Button onClick={handleSetup} loading={busy}>
               创建保险库
             </Button>
             <p className="text-xs text-ink-500 leading-relaxed">
@@ -186,6 +165,7 @@ function Field({
   type = "text",
   placeholder,
   autoFocus,
+  onSubmit,
 }: {
   label: string;
   value: string;
@@ -193,6 +173,7 @@ function Field({
   type?: string;
   placeholder?: string;
   autoFocus?: boolean;
+  onSubmit?: () => void;
 }) {
   return (
     <label className="block space-y-1.5">
@@ -203,6 +184,9 @@ function Field({
         autoFocus={autoFocus}
         placeholder={placeholder}
         onChange={(e) => onChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (onSubmit && e.key === "Enter") onSubmit();
+        }}
         className="w-full bg-ink-900/80 border border-white/10 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-accent focus:bg-ink-900"
       />
     </label>
