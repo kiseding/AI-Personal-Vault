@@ -31,7 +31,6 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
     setLoading(true);
     setError(null);
     try {
-      sessionStorage.setItem("vault_app_token", appToken);
       const c = await api.vaultConfig();
       setConfig(c);
       if (c.setup && c.salt && c.verifier) {
@@ -43,6 +42,12 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleConnect = async () => {
+    if (!appToken.trim()) return setError("请输入应用令牌");
+    sessionStorage.setItem("vault_app_token", appToken.trim());
+    await loadConfig();
   };
 
   useEffect(() => {
@@ -126,7 +131,7 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
               onChange={setAppTokenState}
               placeholder="部署时设置的 APP_TOKEN"
             />
-            <Button onClick={loadConfig} loading={loading}>
+            <Button onClick={handleConnect} loading={loading}>
               连接
             </Button>
           </>
