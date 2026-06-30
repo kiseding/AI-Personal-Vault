@@ -66,13 +66,15 @@ npx wrangler kv namespace create KV
 
 在仓库 **Settings → Secrets and variables → Actions** 中添加：
 
-| Secret | 说明 |
-| --- | --- |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token（需 Workers / D1 / R2 / KV 权限） |
-| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID（Dashboard 右侧栏） |
-| `D1_DATABASE_ID` | 上一步获取的 D1 database_id |
-| `KV_NAMESPACE_ID` | 上一步获取的 KV namespace id |
-| `APP_TOKEN` | 应用访问令牌（自定义随机长字符串） |
+| Secret | 说明 | 获取方式 |
+| --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare API Token | Dashboard → My Profile → API Tokens → Create Token，勾选 Workers/D1/R2/KV Edit 权限 |
+| `CLOUDFLARE_ACCOUNT_ID` | Cloudflare Account ID | Dashboard 首页右侧栏 |
+| `D1_DATABASE_ID` | D1 数据库 ID | 第 1 步 `wrangler d1 create` 返回的 database_id |
+| `KV_NAMESPACE_ID` | KV 命名空间 ID | 第 1 步 `wrangler kv namespace create` 返回的 id |
+| `APP_TOKEN` | 应用访问令牌 | 自定义随机长字符串（如 `openssl rand -hex 32`），用于 API 鉴权 |
+
+> R2 通过 bucket name `ai-personal-vault-attachments` 自动绑定，无需单独配置 Secret。
 
 ### 第 3 步：推送即部署
 
