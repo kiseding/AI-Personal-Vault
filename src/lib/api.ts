@@ -166,4 +166,21 @@ export const api = {
         return json.data;
       },
     ),
+
+  listShares: () =>
+    req<
+      Array<{
+        id: string;
+        entry_id: string;
+        entry_title: string | null;
+        expires_at: string;
+        max_uses: number;
+        used_count: number;
+        created_at: string;
+        is_expired: number;
+      }>
+    >("/api/ai/shares"),
+
+  revokeShare: (shareId: string) =>
+    req<null>(`/api/ai/share/${shareId}`, { method: "DELETE" }),
 };

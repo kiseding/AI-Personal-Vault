@@ -14,6 +14,8 @@ import {
   type EntryContent,
 } from "@/shared/types";
 import { EntryEditor } from "./EntryEditor";
+import { ShareDialog } from "./ShareDialog";
+import { ShareCenter } from "./ShareCenter";
 
 type Filter =
   | { kind: "all" }
@@ -34,7 +36,7 @@ const NAV: { key: string; label: string; icon: string; filter: Filter }[] = [
   })),
 ];
 
-export function Vault({ onLock }: { onLock: () => void }) {
+export function Vault() {
   const [entries, setEntries] = useState<Entry[]>([]);
   const [filter, setFilter] = useState<Filter>({ kind: "all" });
   const [query, setQuery] = useState("");
@@ -42,6 +44,10 @@ export function Vault({ onLock }: { onLock: () => void }) {
   const [editing, setEditing] = useState<Entry | "new" | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<"vault" | "shares">("vault");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  // 移动端：列表 ↔ 详情 全屏切换（桌面端忽略）
+  const [mobileView, setMobileView] = useState<"list" | "detail">("list");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -68,6 +74,29 @@ export function Vault({ onLock }: { onLock: () => void }) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // 监听侧栏的 filter 切换事件（解耦，避免 prop drilling）
+  useEffect(() => {
+    const filterHandler = (e: Event) => {
+      const detail = (e as CustomEvent<Filter>).detail;
+      setFilter(detail);
+      setSelectedId(null);
+    };
+    const newHandler = () => setEditing("new");
+    const lockHandler = () => {
+      session.lock();
+      // 通知 App 重新渲染为 Auth
+      window.dispatchEvent(new Event("app:lock"));
+    };
+    window.addEventListener("vault:set-filter", filterHandler);
+    window.addEventListener("vault:new-entry", newHandler);
+    window.addEventListener("vault:lock", lockHandler);
+    return () => {
+      window.removeEventListener("vault:set-filter", filterHandler);
+      window.removeEventListener("vault:new-entry", newHandler);
+      window.removeEventListener("vault:lock", lockHandler);
+    };
+  }, []);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -96,61 +125,52 @@ export function Vault({ onLock }: { onLock: () => void }) {
     );
   }
 
+  if (view === "shares") {
+    return (
+      <div className="flex h-screen">
+        <Sidebar
+          view={view}
+          onChangeView={setView}
+          mobileOpen={mobileNavOpen}
+          onCloseMobile={() => setMobileNavOpen(false)}
+        />
+        <ShareCenter onBack={() => setView("vault")} />
+      </div>
+    );
+  }
+
   return (
     <div className="flex h-screen">
       {/* 侧栏 */}
-      <aside className="w-60 shrink-0 glass border-r border-white/5 flex flex-col">
-        <div className="p-4 flex items-center justify-between">
-          <span className="font-semibold flex items-center gap-2">
-            <span>🔐</span> Vault
-          </span>
-          <button
-            onClick={onLock}
-            className="text-xs text-ink-400 hover:text-ink-100 px-2 py-1 rounded-lg hover:bg-white/5"
-          >
-            锁定
-          </button>
-        </div>
-        <button
-          onClick={() => setEditing("new")}
-          className="mx-3 mb-2 bg-accent hover:bg-accent-hover text-white text-sm rounded-xl py-2 font-medium"
-        >
-          + 新建
-        </button>
-        <nav className="flex-1 overflow-y-auto px-2 pb-4 space-y-0.5">
-          {NAV.map((item) => (
-            <NavBtn
-              key={item.key}
-              active={JSON.stringify(item.filter) === JSON.stringify(filter)}
-              onClick={() => {
-                setFilter(item.filter);
-                setSelectedId(null);
-              }}
-              icon={item.icon}
-              label={item.label}
-            />
-          ))}
-          <div className="h-px bg-white/5 my-2" />
-          <NavBtn
-            active={filter.kind === "trashed"}
-            onClick={() => {
-              setFilter({ kind: "trashed" });
-              setSelectedId(null);
-            }}
-            icon="🗑️"
-            label="回收站"
-          />
-        </nav>
-      </aside>
+      <Sidebar
+        view={view}
+        onChangeView={setView}
+        mobileOpen={mobileNavOpen}
+        onCloseMobile={() => setMobileNavOpen(false)}
+      />
 
-      {/* 列表 */}
-      <section className="w-80 shrink-0 border-r border-white/5 flex flex-col">
-        <div className="p-3">
+      {/* 列表（移动端：详情页时整列隐藏；桌面端始终显示） */}
+      <section
+        className={
+          mobileView === "detail"
+            ? "hidden sm:flex w-full sm:w-80 shrink-0 border-r border-white/5 flex flex-col"
+            : "flex w-full sm:w-80 shrink-0 border-r border-white/5 flex-col"
+        }
+      >
+        <div className="p-3 flex items-center gap-2">
+          {/* 移动端汉堡菜单 */}
+          <button
+            onClick={() => setMobileNavOpen(true)}
+            className="sm:hidden w-9 h-9 flex items-center justify-center rounded-xl hover:bg-white/10"
+            title="菜单"
+          >
+            ☰
+          </button>
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="搜索标题或标签…"
-            className="w-full bg-ink-900/80 border border-white/10 rounded-xl px-3 py-2 text-sm outline-none focus:border-accent"
+            className="flex-1 bg-ink-900/80 border border-white/10 rounded-xl px-3 py-2 text-sm outline-none focus:border-accent"
           />
         </div>
         <div className="flex-1 overflow-y-auto px-2 pb-4">
@@ -168,16 +188,33 @@ export function Vault({ onLock }: { onLock: () => void }) {
               key={e.id}
               entry={e}
               active={e.id === selectedId}
-              onClick={() => setSelectedId(e.id)}
+              onClick={() => {
+                setSelectedId(e.id);
+                setMobileView("detail");
+              }}
             />
           ))}
         </div>
       </section>
 
-      {/* 详情 */}
-      <main className="flex-1 overflow-y-auto">
+      {/* 详情（移动端：列表页时整块隐藏；桌面端始终显示） */}
+      <main
+        className={
+          mobileView === "list"
+            ? "hidden sm:flex flex-1 overflow-y-auto"
+            : "flex sm:flex flex-1 overflow-y-auto"
+        }
+      >
         {selected ? (
-          <EntryDetail entry={selected} onEdit={() => setEditing(selected)} onChanged={refresh} />
+          <EntryDetail
+            entry={selected}
+            onEdit={() => setEditing(selected)}
+            onChanged={refresh}
+            onBack={() => {
+              setSelectedId(null);
+              setMobileView("list");
+            }}
+          />
         ) : (
           <div className="h-full flex items-center justify-center text-ink-600">
             <div className="text-center space-y-2">
@@ -188,6 +225,127 @@ export function Vault({ onLock }: { onLock: () => void }) {
         )}
       </main>
     </div>
+  );
+}
+
+/**
+ * 侧栏（移动端为 drawer，桌面端为常驻）
+ */
+function Sidebar({
+  view,
+  onChangeView,
+  mobileOpen,
+  onCloseMobile,
+}: {
+  view: "vault" | "shares";
+  onChangeView: (v: "vault" | "shares") => void;
+  mobileOpen: boolean;
+  onCloseMobile: () => void;
+}) {
+  const [filter, setFilterLocal] = useState<Filter>({ kind: "all" });
+  // 同步当前 vault filter 到全局（仅在 vault view 下有效）
+  // 这里复用外部的 filter 较复杂，简化为 Sidebar 内部点击会触发一个事件
+
+  // 移动端 drawer
+  const drawerClasses = mobileOpen
+    ? "fixed inset-y-0 left-0 z-40 w-72 sm:relative sm:inset-auto sm:z-auto sm:w-60 sm:shrink-0"
+    : "hidden sm:flex sm:w-60 sm:shrink-0";
+
+  return (
+    <>
+      {/* 移动端 backdrop */}
+      {mobileOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/50 sm:hidden"
+          onClick={onCloseMobile}
+        />
+      )}
+      <aside
+        className={`${drawerClasses} glass border-r border-white/5 flex-col ${
+          mobileOpen ? "flex" : ""
+        }`}
+      >
+        <div className="p-4 flex items-center justify-between">
+          <span className="font-semibold flex items-center gap-2">
+            <span>🔐</span> Vault
+          </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => window.dispatchEvent(new Event("vault:lock"))}
+              className="text-xs text-ink-400 hover:text-ink-100 px-2 py-1 rounded-lg hover:bg-white/5"
+            >
+              锁定
+            </button>
+            {/* 移动端关闭按钮 */}
+            <button
+              onClick={onCloseMobile}
+              className="sm:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/10"
+              title="关闭"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+        <button
+          onClick={() => {
+            window.dispatchEvent(new CustomEvent("vault:new-entry"));
+            onCloseMobile();
+          }}
+          className={`mx-3 mb-2 text-sm rounded-xl py-2 font-medium transition-colors ${
+            view === "vault"
+              ? "bg-accent text-white"
+              : "bg-white/5 text-ink-200 hover:bg-white/10"
+          }`}
+        >
+          + 新建
+        </button>
+        <nav className="flex-1 overflow-y-auto px-2 pb-4 space-y-0.5">
+          {view === "vault" && (
+            <>
+              {NAV.map((item) => (
+                <NavBtn
+                  key={item.key}
+                  active={JSON.stringify(item.filter) === JSON.stringify(filter)}
+                  onClick={() => {
+                    setFilterLocal(item.filter);
+                    // 通过 window 自定义事件通知 Vault 切换 filter
+                    window.dispatchEvent(
+                      new CustomEvent("vault:set-filter", { detail: item.filter }),
+                    );
+                    onCloseMobile();
+                  }}
+                  icon={item.icon}
+                  label={item.label}
+                />
+              ))}
+              <div className="h-px bg-white/5 my-2" />
+              <NavBtn
+                active={filter.kind === "trashed"}
+                onClick={() => {
+                  setFilterLocal({ kind: "trashed" });
+                  window.dispatchEvent(
+                    new CustomEvent("vault:set-filter", { detail: { kind: "trashed" } }),
+                  );
+                  onCloseMobile();
+                }}
+                icon="🗑️"
+                label="回收站"
+              />
+            </>
+          )}
+          <div className="h-px bg-white/5 my-2" />
+          <NavBtn
+            active={view === "shares"}
+            onClick={() => {
+              onChangeView("shares");
+              onCloseMobile();
+            }}
+            icon="🔗"
+            label="分享中心"
+          />
+        </nav>
+      </aside>
+    </>
   );
 }
 
@@ -258,14 +416,17 @@ function EntryDetail({
   entry,
   onEdit,
   onChanged,
+  onBack,
 }: {
   entry: Entry;
   onEdit: () => void;
   onChanged: () => void;
+  onBack?: () => void;
 }) {
   const [content, setContent] = useState<EntryContent | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [showShare, setShowShare] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -303,12 +464,22 @@ function EntryDetail({
   };
 
   return (
-    <div className="max-w-2xl mx-auto p-8 space-y-6">
-      <div className="flex items-start gap-4">
-        <span className="text-3xl">{entry.icon ?? meta.icon}</span>
-        <div className="flex-1">
-          <h1 className="text-2xl font-semibold">{entry.title}</h1>
-          <div className="flex items-center gap-2 mt-1 text-sm text-ink-400">
+    <div className="max-w-2xl mx-auto p-4 sm:p-8 space-y-6">
+      {/* 移动端返回按钮 */}
+      {onBack && (
+        <button
+          onClick={onBack}
+          className="sm:hidden -ml-2 w-9 h-9 flex items-center justify-center rounded-xl hover:bg-white/10 text-base"
+          title="返回列表"
+        >
+          ← 返回
+        </button>
+      )}
+      <div className="flex items-start gap-3 sm:gap-4">
+        <span className="text-3xl shrink-0">{entry.icon ?? meta.icon}</span>
+        <div className="flex-1 min-w-0">
+          <h1 className="text-xl sm:text-2xl font-semibold break-words">{entry.title}</h1>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1 text-xs sm:text-sm text-ink-400">
             <span>{meta.label}</span>
             <span>·</span>
             <span>{new Date(entry.updated_at).toLocaleString()}</span>
@@ -326,9 +497,12 @@ function EntryDetail({
             </div>
           )}
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-1 shrink-0">
           <IconBtn onClick={handleFavorite} title="收藏">
             {entry.favorite ? "★" : "☆"}
+          </IconBtn>
+          <IconBtn onClick={() => setShowShare(true)} title="分享给 AI">
+            🔗
           </IconBtn>
           <IconBtn onClick={onEdit} title="编辑">
             ✏️
@@ -360,6 +534,9 @@ function EntryDetail({
             </div>
           )}
         </div>
+      )}
+      {showShare && (
+        <ShareDialog entryId={entry.id} onClose={() => setShowShare(false)} />
       )}
     </div>
   );

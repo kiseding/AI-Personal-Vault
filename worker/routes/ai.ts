@@ -312,3 +312,42 @@ function constantTimeEqual(a: string, b: string): boolean {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
+
+// --- 列出所有分享（管理用，需主鉴权） ---------------------------------------
+// 返回所有未过期的分享，附带是否已用完的标记
+ai.get("/shares", async (c) => {
+  const res = await c.env.DB
+    .prepare(
+      `SELECT id, entry_id, entry_title, expires_at, max_uses, used_count, created_at,
+              CASE WHEN expires_at < datetime('now') THEN 1 ELSE 0 END as is_expired
+       FROM ai_shares
+       ORDER BY created_at DESC
+       LIMIT 200`,
+    )
+    .all<
+      Pick<
+        ShareRow,
+        | "id"
+        | "entry_id"
+        | "entry_title"
+        | "expires_at"
+        | "max_uses"
+        | "used_count"
+        | "created_at"
+      > & { is_expired: number }
+    >();
+  return c.json({ ok: true, data: res.results });
+});
+
+// --- 撤销分享（用户主动删除）-------------------------------------------------
+ai.delete("/share/:shareId", async (c) => {
+  const shareId = c.req.param("shareId");
+  const row = await c.env.DB
+    .prepare("SELECT entry_id FROM ai_shares WHERE id=?")
+    .bind(shareId)
+    .first<{ entry_id: string }>();
+  if (!row) return c.json({ ok: false, error: "分享不存在" }, 404);
+  await c.env.DB.prepare("DELETE FROM ai_shares WHERE id=?").bind(shareId).run();
+  audit(c, row.entry_id, `ai-share-revoke`, true);
+  return c.json({ ok: true });
+});
