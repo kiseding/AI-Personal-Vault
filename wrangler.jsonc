@@ -15,7 +15,7 @@
     {
       "binding": "DB",
       "database_name": "ai-personal-vault",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "${D1_DATABASE_ID}",
       "migrations_dir": "migrations"
     }
   ],
@@ -30,7 +30,7 @@
   "kv_namespaces": [
     {
       "binding": "KV",
-      "id": "00000000000000000000000000000000"
+      "id": "${KV_NAMESPACE_ID}"
     }
   ],
   // 观测性
