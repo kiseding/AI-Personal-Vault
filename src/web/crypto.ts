@@ -188,3 +188,105 @@ export async function verifyPassword(
     return null;
   }
 }
+
+// ----------------------------------------------------------------------------
+// AI 分享（百度网盘模式）：用 4 位提取码派生临时密钥加密明文
+// ----------------------------------------------------------------------------
+// 流程：用户浏览器用主密钥解密 entry 明文 → 提取码派生临时密钥 → 加密上传
+// AI 拿到 share_id + 提取码后 → 本地派生密钥 → 解密得到明文
+// 服务器始终不接触明文。
+
+/** 生成 4 位数字提取码（0000-9999） */
+export function generateShareCode(): string {
+  return Math.floor(Math.random() * 10000)
+    .toString()
+    .padStart(4, "0");
+}
+
+/** 生成 16 字节分享 salt（base64） */
+export function generateShareSalt(): string {
+  return bytesToBase64(crypto.getRandomValues(new Uint8Array(SALT_LENGTH)));
+}
+
+/** 提取码 SHA-256 哈希（服务器比对用，与 worker 逻辑一致） */
+export async function hashShareCode(code: string): Promise<string> {
+  const buf = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(code),
+  );
+  return [...new Uint8Array(buf)]
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+/** 用提取码派生 AES-GCM 临时密钥（PBKDF2-SHA256，提取码空间小需高迭代） */
+async function deriveShareKey(
+  code: string,
+  saltB64: string,
+): Promise<CryptoKey> {
+  const salt = base64ToBytes(saltB64);
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(code),
+    "PBKDF2",
+    false,
+    ["deriveKey"],
+  );
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: toArrayBuffer(salt),
+      iterations: 100_000,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: KEY_LENGTH },
+    false,
+    ["encrypt", "decrypt"],
+  );
+}
+
+export interface SharePayload extends EncryptedPayload {
+  /** 提取码 salt（base64），服务器原样返回给 AI */
+  salt: string;
+}
+
+/** 用提取码加密明文（用户上传时调用） */
+export async function encryptWithShareCode(
+  plaintext: string,
+): Promise<{ code: string; payload: SharePayload }> {
+  const code = generateShareCode();
+  const salt = generateShareSalt();
+  const key = await deriveShareKey(code, salt);
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const data = new TextEncoder().encode(plaintext);
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(data),
+  );
+  return {
+    code,
+    payload: {
+      ciphertext: bytesToBase64(new Uint8Array(ct)),
+      iv: bytesToBase64(iv),
+      salt,
+    },
+  };
+}
+
+/** 用提取码解密（AI 端调用） */
+export async function decryptWithShareCode(
+  code: string,
+  payload: SharePayload,
+): Promise<string> {
+  const key = await deriveShareKey(code, payload.salt);
+  const iv = base64ToBytes(payload.iv);
+  const ct = base64ToBytes(payload.ciphertext);
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(ct),
+  );
+  return new TextDecoder().decode(plainBuf);
+}

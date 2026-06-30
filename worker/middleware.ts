@@ -16,7 +16,10 @@ import type { AppContext } from "./env";
  */
 export const authMiddleware = createMiddleware<AppContext>(async (c, next) => {
   // AI 读取端点使用独立的临时 Token 鉴权（见 routes/ai.ts），不走 APP_TOKEN
-  if (c.req.path.startsWith("/api/ai/fetch")) {
+  if (
+    c.req.path.startsWith("/api/ai/fetch") ||
+    (c.req.method === "GET" && c.req.path.startsWith("/api/ai/share/"))
+  ) {
     await next();
     return;
   }

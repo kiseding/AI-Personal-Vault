@@ -5,7 +5,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import { session } from "../lib/session";
-import { decryptContent, encryptContent } from "@/web/crypto";
+import { decryptContent, encryptContent, encryptWithShareCode, hashShareCode } from "@/web/crypto";
 import {
   ENTRY_TYPES,
   ENTRY_TYPE_META,
@@ -256,6 +256,17 @@ function AiPanel({ entryId }: { entryId: string }) {
   const [selAgent, setSelAgent] = useState<AiAgent>("claude-code");
   const [selTtl, setSelTtl] = useState(60);
 
+  // 分享链接状态（百度网盘模式：链接 + 4 位提取码）
+  const [shareResult, setShareResult] = useState<{
+    share_id: string;
+    code: string;
+    expires_at: string;
+    max_uses: number;
+    origin: string;
+  } | null>(null);
+  const [shareBusy, setShareBusy] = useState(false);
+  const [shareError, setShareError] = useState<string | null>(null);
+
   const load = async () => {
     const g = await api.getGrants(entryId);
     setGrants(g.map((x) => ({ agent: x.agent, permission: x.permission })));
@@ -274,6 +285,44 @@ function AiPanel({ entryId }: { entryId: string }) {
     const t = await api.issueToken(entryId, selAgent, selTtl);
     setTokenInfo(t);
   };
+
+  const createShareLink = async () => {
+    setShareBusy(true);
+    setShareError(null);
+    try {
+      const e = await api.getEntry(entryId);
+      const plain = await decryptContent(session.key(), {
+        ciphertext: e.encrypted_content,
+        iv: e.iv,
+      });
+      const { code, payload } = await encryptWithShareCode(
+        JSON.stringify({ title: e.title, fields: plain.fields, notes: plain.notes }),
+      );
+      const codeHash = await hashShareCode(code);
+      const r = await api.createShare({
+        entry_id: entryId,
+        ciphertext: payload.ciphertext,
+        iv: payload.iv,
+        salt: payload.salt,
+        code_hash: codeHash,
+      });
+      setShareResult({
+        share_id: r.share_id,
+        code,
+        expires_at: r.expires_at,
+        max_uses: r.max_uses,
+        origin: window.location.origin,
+      });
+    } catch (e) {
+      setShareError((e as Error).message);
+    } finally {
+      setShareBusy(false);
+    }
+  };
+
+  const shareLinkText = shareResult
+    ? `${shareResult.origin}/api/ai/share/${shareResult.share_id}?code=${shareResult.code}`
+    : "";
 
   return (
     <div className="glass rounded-2xl p-4 space-y-4">
@@ -304,7 +353,7 @@ function AiPanel({ entryId }: { entryId: string }) {
       </div>
 
       <div className="border-t border-white/5 pt-4 space-y-2">
-        <div className="text-xs text-ink-400">生成临时访问令牌</div>
+        <div className="text-xs text-ink-400">生成临时访问令牌（X-AI-Token）</div>
         <div className="flex gap-2">
           <select
             value={selAgent}
@@ -341,6 +390,79 @@ function AiPanel({ entryId }: { entryId: string }) {
             <code className="text-xs text-emerald-400 break-all">
               {tokenInfo.token}
             </code>
+          </div>
+        )}
+      </div>
+
+      {/* 百度网盘式分享：链接 + 4 位提取码 */}
+      <div className="border-t border-white/5 pt-4 space-y-2">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-xs text-ink-400">分享给 AI（链接 + 提取码）</div>
+            <div className="text-[10px] text-ink-500 mt-0.5">
+              5 分钟内有效，最多 5 次提取，提取码不在服务器保存
+            </div>
+          </div>
+          <button
+            onClick={createShareLink}
+            disabled={shareBusy}
+            className="bg-accent hover:bg-accent-hover disabled:opacity-50 text-white text-xs rounded-lg px-3 py-1.5"
+          >
+            {shareBusy ? "生成中…" : "生成分享"}
+          </button>
+        </div>
+        {shareError && (
+          <div className="text-[10px] text-red-400 bg-red-500/10 rounded-lg px-2 py-1">
+            {shareError}
+          </div>
+        )}
+        {shareResult && (
+          <div className="bg-ink-950/60 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between text-[10px] text-ink-500">
+              <span>
+                有效至 {new Date(shareResult.expires_at).toLocaleTimeString()} ·
+                最多 {shareResult.max_uses} 次
+              </span>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(shareLinkText);
+                }}
+                className="text-accent hover:underline"
+              >
+                复制全部
+              </button>
+            </div>
+            <div>
+              <div className="text-[10px] text-ink-500">分享链接</div>
+              <code className="text-[11px] text-ink-200 break-all">
+                {shareResult.origin}/api/ai/share/{shareResult.share_id}
+              </code>
+            </div>
+            <div>
+              <div className="text-[10px] text-ink-500">提取码（4 位）</div>
+              <div className="flex items-center gap-2">
+                <code className="text-2xl font-mono font-bold text-emerald-400 tracking-widest">
+                  {shareResult.code}
+                </code>
+                <button
+                  onClick={() => {
+                    navigator.clipboard.writeText(shareResult.code);
+                  }}
+                  className="text-[10px] text-ink-400 hover:text-ink-200"
+                >
+                  复制
+                </button>
+              </div>
+            </div>
+            <div className="text-[10px] text-ink-500 leading-relaxed pt-1 border-t border-white/5">
+              AI 端调用：
+              <code className="block mt-0.5 text-ink-400 break-all">
+                curl &quot;{shareResult.origin}/api/ai/share/{shareResult.share_id}?code={shareResult.code}&quot;
+              </code>
+              <span className="block mt-1">
+                返回密文后用提取码本地 AES-GCM 解密（100k 迭代 PBKDF2-SHA256）。
+              </span>
+            </div>
           </div>
         )}
       </div>

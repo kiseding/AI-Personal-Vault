@@ -134,4 +134,36 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ entry_id: entryId, agent, ttl }),
     }),
+
+  // --- AI 分享（百度网盘模式：链接 + 提取码）------------------------------
+  createShare: (body: {
+    entry_id: string;
+    ciphertext: string;
+    iv: string;
+    salt: string;
+    code_hash: string;
+    ttl?: number;
+    max_uses?: number;
+  }) =>
+    req<{ share_id: string; expires_at: string; max_uses: number; ttl: number }>(
+      "/api/ai/share",
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+  fetchShare: (shareId: string, code: string) =>
+    fetch(`/api/ai/share/${shareId}?code=${encodeURIComponent(code)}`).then(
+      async (res) => {
+        const json = (await res.json()) as ApiResponse<{
+          entry_id: string;
+          entry_title: string | null;
+          ciphertext: string;
+          iv: string;
+          salt: string;
+          used_count: number;
+          max_uses: number;
+          remaining: number;
+        }>;
+        if (!json.ok) throw new Error(json.error ?? "提取失败");
+        return json.data;
+      },
+    ),
 };
