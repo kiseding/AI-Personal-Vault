@@ -47,6 +47,10 @@ npm run dev
 
 ### 第 1 步：创建 Cloudflare 资源
 
+先在 [Cloudflare Dashboard](https://dash.cloudflare.com) 中启用 D1 和 R2（R2 需绑定信用卡，免费额度不扣费）。
+
+然后本地登录 wrangler 并创建资源：
+
 ```bash
 npx wrangler login
 npx wrangler d1 create ai-personal-vault
@@ -55,6 +59,8 @@ npx wrangler kv namespace create KV
 ```
 
 记下返回的 `database_id` 和 KV `id`。
+
+> 创建 API Token 时需勾选权限：Workers Scripts（Edit）、D1（Edit）、R2（Edit）、KV Storage（Edit）。
 
 ### 第 2 步：配置 GitHub Secrets
 
