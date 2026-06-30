@@ -1,0 +1,40 @@
+{
+  // AI Personal Vault - Cloudflare Worker 配置
+  // 文档: https://developers.cloudflare.com/workers/wrangler/configuration/
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-personal-vault",
+  "main": "./worker/index.ts",
+  "compatibility_date": "2026-06-01",
+  "assets": {
+    // Vite 构建的前端产物由 @cloudflare/vite-plugin 自动托管
+    // SPA 模式：未匹配静态资源的路径回退到 index.html
+    "not_found_handling": "single-page-application"
+  },
+  // D1 数据库：存储 Entry 元数据、标签、版本、审计日志（仅密文）
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-personal-vault",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  // R2 对象存储：存储加密附件
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "ai-personal-vault-attachments"
+    }
+  ],
+  // KV：存储 AI 临时访问 Token、会话、配置缓存
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  // 观测性
+  "observability": {
+    "enabled": true
+  }
+}

@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark light;
+}
+
+* {
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-ink-950 text-ink-100 antialiased;
+  font-family: theme("fontFamily.sans");
+  overscroll-behavior: none;
+}
+
+/* 滚动条 - Apple 风格细滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  @apply bg-ink-700/60 rounded-full;
+}
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-ink-600/80;
+}
+
+/* 输入框聚焦动效 */
+input,
+textarea,
+button {
+  @apply transition-colors duration-200 ease-apple;
+}
+
+/* 毛玻璃容器 */
+.glass {
+  @apply bg-ink-900/60 backdrop-blur-xl border border-white/5;
+}
