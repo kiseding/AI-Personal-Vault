@@ -3,11 +3,13 @@
  * - /            → 显示 404（隐藏真实入口）
  * - /open        → vault
  * - /open/*      → vault 内部视图（分享中心、详情等）
+ *
+ * 本文件现在主要导出 NotFound 和 usePath 供 App.tsx 使用。
+ * 实际鉴权 + 路由分发由 App.tsx 完成（Auth 拦截 /open，未解锁不让进）。
  */
 import { useEffect, useState } from "react";
-import { Vault } from "./Vault";
 
-function NotFound() {
+export function NotFound() {
   return (
     <div className="min-h-screen flex items-center justify-center px-5">
       <div className="text-center space-y-3">
@@ -21,7 +23,7 @@ function NotFound() {
   );
 }
 
-function usePath(): string {
+export function usePath(): string {
   const [path, setPath] = useState(() => window.location.pathname);
   useEffect(() => {
     const onPop = () => setPath(window.location.pathname);
@@ -29,18 +31,4 @@ function usePath(): string {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
   return path;
-}
-
-export function AppRouter() {
-  const path = usePath();
-
-  // 根路径 → 404（不暴露真实入口）
-  if (path === "/" || path === "") {
-    return <NotFound />;
-  }
-  // 真实入口
-  if (path === "/open" || path.startsWith("/open/")) {
-    return <Vault />;
-  }
-  return <NotFound />;
 }
