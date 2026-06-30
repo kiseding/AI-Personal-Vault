@@ -28,6 +28,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Substitute env vars in wrangler.jsonc
+        run: envsubst < wrangler.jsonc > wrangler.tmp && mv wrangler.tmp wrangler.jsonc
+
       - name: Build
         run: npm run build
 
