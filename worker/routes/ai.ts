@@ -8,6 +8,10 @@
  *   4. 所有访问记录审计日志（时间/Agent/IP/Entry/成功失败）
  *
  * 服务器始终只返回密文；AI Agent 用用户预先派生的共享密钥本地解密。
+ *
+ * 批量分享（0003 迁移）：
+ *   POST /api/ai/share 增加 kind=batch 分支，支持一次性分享多个 entry + 可选附件。
+ *   bundle 在浏览器侧用提取码派生密钥加密后整体上传，服务器零知识保持。
  */
 import { Hono } from "hono";
 import type { AppContext } from "../env";
@@ -162,7 +166,9 @@ ai.get("/fetch/:entryId", async (c) => {
 // GET  /api/ai/share/:id   AI 提取（不需要 APP_TOKEN，需要正确提取码）
 //
 // 关键点：
-//   - 浏览器用主密钥解密 entry 明文 → 提取码派生临时密钥 → 加密后上传
+//   - kind=single: 浏览器用主密钥解密 entry → 提取码派生密钥加密密文 → 上传
+//   - kind=batch:  浏览器解密 N 个 entry + 可选附件 → 打包成 bundle JSON
+//                  → 用提取码派生密钥加密 bundle → 上传
 //   - 服务器只存密文，code 只存 SHA-256 哈希（避免 DB 泄露泄露提取码）
 //   - 提取后 used_count+1，到 max_uses 后删除
 //   - 过期后返回 410
@@ -179,56 +185,154 @@ interface ShareRow {
   max_uses: number;
   used_count: number;
   created_at: string;
+  kind: string;
+  item_count: number;
+  entry_ids_json: string | null;
+  entry_titles_json: string | null;
+  files_json: string | null;
+}
+
+interface FileMetaInput {
+  name: string;
+  mime: string;
+  size: number;
+  ciphertext: string;
+  iv: string;
 }
 
 const DEFAULT_TTL_SEC = 300; // 5 分钟
 const DEFAULT_MAX_USES = 5;
+const BUNDLE_MAX_BYTES = 5 * 1024 * 1024; // 5 MB 上限（明文 bundle）
 
 // --- 用户创建分享（需 APP_TOKEN） ------------------------------------------
 ai.post("/share", async (c) => {
   const body = await c.req.json<{
-    entry_id: string;
+    kind?: "single" | "batch";
+    // single 模式
+    entry_id?: string;
+    // batch 模式
+    entry_ids?: string[];
+    // 通用：密文 + 提取码材料
     ciphertext: string;
     iv: string;
     salt: string;
     code_hash: string;
+    // batch 可选附件（仅元信息，密文内嵌 bundle）
+    files?: FileMetaInput[];
+    // 控制
     ttl?: number;
     max_uses?: number;
   }>();
 
-  const entry = await c.env.DB
-    .prepare("SELECT id, title, deleted_at FROM entries WHERE id=?")
-    .bind(body.entry_id)
-    .first<{ id: string; title: string; deleted_at: string | null }>();
-  if (!entry || entry.deleted_at) {
-    return c.json({ ok: false, error: "Entry 不存在" }, 404);
-  }
-
-  const id = crypto.randomUUID().replaceAll("-", "");
+  const kind = body.kind ?? "single";
   const ttl = body.ttl ?? DEFAULT_TTL_SEC;
   const maxUses = body.max_uses ?? DEFAULT_MAX_USES;
   const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
 
+  // 简单大小校验：bundle 密文 base64 解码后近似上限
+  if (body.ciphertext.length > BUNDLE_MAX_BYTES * 1.4) {
+    return c.json(
+      {
+        ok: false,
+        error: `分享过大（>${BUNDLE_MAX_BYTES / 1024 / 1024}MB），请减少条目或附件`,
+      },
+      413,
+    );
+  }
+
+  let primaryEntryId: string;
+  let primaryEntryTitle: string;
+  let itemCount = 1;
+  let entryIdsJson: string | null = null;
+  let entryTitlesJson: string | null = null;
+  let filesJson: string | null = null;
+
+  if (kind === "single") {
+    if (!body.entry_id) {
+      return c.json({ ok: false, error: "single 分享需要 entry_id" }, 400);
+    }
+    const entry = await c.env.DB
+      .prepare("SELECT id, title, deleted_at FROM entries WHERE id=?")
+      .bind(body.entry_id)
+      .first<{ id: string; title: string; deleted_at: string | null }>();
+    if (!entry || entry.deleted_at) {
+      return c.json({ ok: false, error: "Entry 不存在" }, 404);
+    }
+    primaryEntryId = entry.id;
+    primaryEntryTitle = entry.title;
+  } else if (kind === "batch") {
+    if (!body.entry_ids || body.entry_ids.length === 0) {
+      return c.json(
+        { ok: false, error: "batch 分享至少需要 1 个 entry_id" },
+        400,
+      );
+    }
+    if (body.entry_ids.length > 100) {
+      return c.json({ ok: false, error: "批量最多 100 条 entry" }, 400);
+    }
+    const placeholders = body.entry_ids.map(() => "?").join(",");
+    const rows = await c.env.DB
+      .prepare(
+        `SELECT id, title, deleted_at FROM entries WHERE id IN (${placeholders})`,
+      )
+      .bind(...body.entry_ids)
+      .all<{ id: string; title: string; deleted_at: string | null }>();
+    if (rows.results.length !== body.entry_ids.length) {
+      return c.json({ ok: false, error: "部分 entry 不存在" }, 404);
+    }
+    if (rows.results.some((r) => r.deleted_at)) {
+      return c.json({ ok: false, error: "包含已删除的 entry" }, 400);
+    }
+    primaryEntryId = body.entry_ids[0]; // 用于审计
+    const titles = rows.results.map((r) => r.title);
+    primaryEntryTitle =
+      titles.length <= 3
+        ? titles.join(", ")
+        : `${titles.slice(0, 3).join(", ")} 等 ${titles.length} 条`;
+    itemCount = body.entry_ids.length;
+    entryIdsJson = JSON.stringify(body.entry_ids);
+    entryTitlesJson = JSON.stringify(titles);
+    if (body.files && body.files.length > 0) {
+      filesJson = JSON.stringify(
+        body.files.map((f) => ({
+          name: f.name,
+          mime: f.mime,
+          size: f.size,
+        })),
+      );
+    }
+  } else {
+    return c.json({ ok: false, error: "未知 kind" }, 400);
+  }
+
+  const id = crypto.randomUUID().replaceAll("-", "");
+
   await c.env.DB
     .prepare(
       `INSERT INTO ai_shares
-       (id, entry_id, entry_title, code_hash, ciphertext, iv, salt, expires_at, max_uses)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (id, entry_id, entry_title, code_hash, ciphertext, iv, salt, expires_at, max_uses,
+        kind, item_count, entry_ids_json, entry_titles_json, files_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
-      body.entry_id,
-      entry.title,
+      primaryEntryId,
+      primaryEntryTitle,
       body.code_hash,
       body.ciphertext,
       body.iv,
       body.salt,
       expiresAt,
       maxUses,
+      kind,
+      itemCount,
+      entryIdsJson,
+      entryTitlesJson,
+      filesJson,
     )
     .run();
 
-  audit(c, body.entry_id, `ai-share-create`, true);
+  audit(c, primaryEntryId, `ai-share-create:${kind}`, true);
   return c.json({
     ok: true,
     data: {
@@ -236,6 +340,8 @@ ai.post("/share", async (c) => {
       expires_at: expiresAt,
       max_uses: maxUses,
       ttl,
+      kind,
+      item_count: itemCount,
     },
   });
 });
@@ -288,21 +394,39 @@ ai.get("/share/:shareId", async (c) => {
       .bind(newCount, shareId)
       .run();
   }
-  audit(c, row.entry_id, `ai-share-fetch:ok[${newCount}/${row.max_uses}]`, true, "ai");
+  audit(
+    c,
+    row.entry_id,
+    `ai-share-fetch:ok[${newCount}/${row.max_uses}]`,
+    true,
+    "ai",
+  );
 
-  return c.json({
-    ok: true,
-    data: {
-      entry_id: row.entry_id,
-      entry_title: row.entry_title,
-      ciphertext: row.ciphertext,
-      iv: row.iv,
-      salt: row.salt,
-      used_count: newCount,
-      max_uses: row.max_uses,
-      remaining: row.max_uses - newCount,
-    },
-  });
+  const data: Record<string, unknown> = {
+    entry_id: row.entry_id,
+    entry_title: row.entry_title,
+    ciphertext: row.ciphertext,
+    iv: row.iv,
+    salt: row.salt,
+    used_count: newCount,
+    max_uses: row.max_uses,
+    remaining: row.max_uses - newCount,
+  };
+  // 批量分享附加元数据
+  if (row.kind === "batch") {
+    data.kind = "batch";
+    data.item_count = row.item_count;
+    data.entry_ids = row.entry_ids_json ? JSON.parse(row.entry_ids_json) : [];
+    data.entry_titles = row.entry_titles_json
+      ? JSON.parse(row.entry_titles_json)
+      : [];
+    data.file_names = row.files_json
+      ? (JSON.parse(row.files_json) as Array<{ name: string }>).map(
+          (f) => f.name,
+        )
+      : [];
+  }
+  return c.json({ ok: true, data });
 });
 
 /** 常时字符串比较，避免时序攻击泄露哈希前缀 */
@@ -319,6 +443,7 @@ ai.get("/shares", async (c) => {
   const res = await c.env.DB
     .prepare(
       `SELECT id, entry_id, entry_title, expires_at, max_uses, used_count, created_at,
+              kind, item_count,
               CASE WHEN expires_at < datetime('now') THEN 1 ELSE 0 END as is_expired
        FROM ai_shares
        ORDER BY created_at DESC
@@ -334,6 +459,8 @@ ai.get("/shares", async (c) => {
         | "max_uses"
         | "used_count"
         | "created_at"
+        | "kind"
+        | "item_count"
       > & { is_expired: number }
     >();
   return c.json({ ok: true, data: res.results });
