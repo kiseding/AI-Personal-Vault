@@ -83,3 +83,10 @@ export function audit(
       .run(),
   );
 }
+
+// ----------------------------------------------------------------------------
+// 安全响应头与限流（详见 ./lib/security-headers.ts 与 ./lib/rate-limit.ts）
+// ----------------------------------------------------------------------------
+export { securityHeaders } from "./lib/security-headers";
+export { rateLimit, DEFAULT_RULES } from "./lib/rate-limit";
+export type { RateLimitRule } from "./lib/rate-limit";
