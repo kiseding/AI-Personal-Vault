@@ -1,6 +1,11 @@
 /**
  * 主界面：侧栏导航（第九章）+ 列表 + 详情查看
  * 正文搜索在浏览器本地完成（第十一章：服务器不能搜索正文）
+ *
+ * 多选分享（0003 迁移）：
+ *  - 侧栏点 📦 多选 → 进入多选模式（列表项左侧显示 checkbox）
+ *  - 勾选 N 个条目 → 底部出现浮动操作栏
+ *  - 点"生成分享" → 打开 ShareDialog 的批量模式
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
@@ -49,6 +54,11 @@ export function Vault() {
   // 移动端：列表 ↔ 详情 全屏切换（桌面端忽略）
   const [mobileView, setMobileView] = useState<"list" | "detail">("list");
 
+  // 多选模式（批量分享用）
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchShareOpen, setBatchShareOpen] = useState(false);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -61,7 +71,6 @@ export function Vault() {
       else if (filter.kind === "type")
         list = await api.listEntries({ type: filter.type });
       else list = await api.listEntries();
-      // 「最近」按 updated_at 已排序
       setEntries(list);
     } catch (e) {
       setError((e as Error).message);
@@ -81,11 +90,13 @@ export function Vault() {
       const detail = (e as CustomEvent<Filter>).detail;
       setFilter(detail);
       setSelectedId(null);
+      // 切换 filter 时退出多选
+      setMultiSelectMode(false);
+      setSelectedIds(new Set());
     };
     const newHandler = () => setEditing("new");
     const lockHandler = () => {
       session.lock();
-      // 通知 App 重新渲染为 Auth
       window.dispatchEvent(new Event("app:lock"));
     };
     window.addEventListener("vault:set-filter", filterHandler);
@@ -115,6 +126,38 @@ export function Vault() {
 
   const refresh = () => void load();
 
+  // 进入多选模式时清空普通选中
+  const toggleMultiSelectMode = () => {
+    if (multiSelectMode) {
+      setMultiSelectMode(false);
+      setSelectedIds(new Set());
+    } else {
+      setMultiSelectMode(true);
+      setSelectedId(null);
+      setSelectedIds(new Set());
+    }
+  };
+
+  // 切换某条选中状态
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // 多选时，整行点击也切换勾选；非多选时点击进入详情
+  const handleItemClick = (e: Entry) => {
+    if (multiSelectMode) {
+      toggleSelect(e.id);
+    } else {
+      setSelectedId(e.id);
+      setMobileView("detail");
+    }
+  };
+
   if (editing) {
     return (
       <EntryEditor
@@ -131,6 +174,8 @@ export function Vault() {
         <Sidebar
           view={view}
           onChangeView={setView}
+          multiSelectMode={multiSelectMode}
+          onToggleMultiSelect={toggleMultiSelectMode}
           mobileOpen={mobileNavOpen}
           onCloseMobile={() => setMobileNavOpen(false)}
         />
@@ -145,6 +190,8 @@ export function Vault() {
       <Sidebar
         view={view}
         onChangeView={setView}
+        multiSelectMode={multiSelectMode}
+        onToggleMultiSelect={toggleMultiSelectMode}
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
       />
@@ -173,6 +220,18 @@ export function Vault() {
             className="flex-1 bg-ink-900/80 border border-white/10 rounded-xl px-3 py-2 text-sm outline-none focus:border-accent"
           />
         </div>
+        {multiSelectMode && (
+          <div className="px-3 pb-2 text-xs text-accent flex items-center gap-2">
+            <span>📦 多选模式</span>
+            <span className="text-ink-500">已选 {selectedIds.size} 项</span>
+            <button
+              className="ml-auto text-ink-400 hover:text-ink-100"
+              onClick={() => setSelectedIds(new Set())}
+            >
+              清空
+            </button>
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto px-2 pb-4">
           {loading && (
             <div className="text-center text-sm text-ink-500 py-8">加载中…</div>
@@ -187,11 +246,9 @@ export function Vault() {
             <ListItem
               key={e.id}
               entry={e}
-              active={e.id === selectedId}
-              onClick={() => {
-                setSelectedId(e.id);
-                setMobileView("detail");
-              }}
+              active={multiSelectMode ? selectedIds.has(e.id) : e.id === selectedId}
+              multiSelectMode={multiSelectMode}
+              onClick={() => handleItemClick(e)}
             />
           ))}
         </div>
@@ -205,7 +262,9 @@ export function Vault() {
             : "flex sm:flex flex-1 overflow-y-auto"
         }
       >
-        {selected ? (
+        {multiSelectMode ? (
+          <MultiSelectEmpty />
+        ) : selected ? (
           <EntryDetail
             entry={selected}
             onEdit={() => setEditing(selected)}
@@ -224,6 +283,26 @@ export function Vault() {
           </div>
         )}
       </main>
+
+      {/* 多选浮动操作栏 */}
+      {multiSelectMode && selectedIds.size > 0 && (
+        <MultiSelectBar
+          count={selectedIds.size}
+          onShare={() => setBatchShareOpen(true)}
+          onCancel={toggleMultiSelectMode}
+        />
+      )}
+
+      {/* 批量分享对话框 */}
+      {batchShareOpen && (
+        <ShareDialog
+          entryIds={Array.from(selectedIds)}
+          entryTitles={entries
+            .filter((e) => selectedIds.has(e.id))
+            .map((e) => e.title)}
+          onClose={() => setBatchShareOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -234,17 +313,19 @@ export function Vault() {
 function Sidebar({
   view,
   onChangeView,
+  multiSelectMode,
+  onToggleMultiSelect,
   mobileOpen,
   onCloseMobile,
 }: {
   view: "vault" | "shares";
   onChangeView: (v: "vault" | "shares") => void;
+  multiSelectMode: boolean;
+  onToggleMultiSelect: () => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
 }) {
   const [filter, setFilterLocal] = useState<Filter>({ kind: "all" });
-  // 同步当前 vault filter 到全局（仅在 vault view 下有效）
-  // 这里复用外部的 filter 较复杂，简化为 Sidebar 内部点击会触发一个事件
 
   // 移动端 drawer
   const drawerClasses = mobileOpen
@@ -299,6 +380,21 @@ function Sidebar({
         >
           + 新建
         </button>
+        {view === "vault" && (
+          <button
+            onClick={() => {
+              onToggleMultiSelect();
+              onCloseMobile();
+            }}
+            className={`mx-3 mb-2 text-sm rounded-xl py-2 transition-colors flex items-center justify-center gap-2 ${
+              multiSelectMode
+                ? "bg-accent/15 text-accent border border-accent/40"
+                : "bg-white/5 text-ink-200 hover:bg-white/10"
+            }`}
+          >
+            📦 {multiSelectMode ? "退出多选" : "多选分享"}
+          </button>
+        )}
         <nav className="flex-1 overflow-y-auto px-2 pb-4 space-y-0.5">
           {view === "vault" && (
             <>
@@ -308,7 +404,6 @@ function Sidebar({
                   active={JSON.stringify(item.filter) === JSON.stringify(filter)}
                   onClick={() => {
                     setFilterLocal(item.filter);
-                    // 通过 window 自定义事件通知 Vault 切换 filter
                     window.dispatchEvent(
                       new CustomEvent("vault:set-filter", { detail: item.filter }),
                     );
@@ -378,10 +473,12 @@ function NavBtn({
 function ListItem({
   entry,
   active,
+  multiSelectMode,
   onClick,
 }: {
   entry: Entry;
   active: boolean;
+  multiSelectMode: boolean;
   onClick: () => void;
 }) {
   const meta = ENTRY_TYPE_META[entry.type];
@@ -393,6 +490,17 @@ function ListItem({
       }`}
     >
       <div className="flex items-center gap-2">
+        {multiSelectMode && (
+          <span
+            className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] shrink-0 ${
+              active
+                ? "bg-accent border-accent text-white"
+                : "border-white/30"
+            }`}
+          >
+            {active ? "✓" : ""}
+          </span>
+        )}
         <span className="text-lg">{entry.icon ?? meta.icon}</span>
         <span className="flex-1 truncate text-sm font-medium">{entry.title}</span>
         {entry.favorite && <span className="text-amber-400 text-xs">★</span>}
@@ -409,6 +517,51 @@ function ListItem({
         ))}
       </div>
     </button>
+  );
+}
+
+function MultiSelectEmpty() {
+  return (
+    <div className="h-full flex items-center justify-center text-ink-600">
+      <div className="text-center space-y-3 max-w-sm px-6">
+        <div className="text-5xl">📦</div>
+        <p className="text-sm">多选模式已开启</p>
+        <p className="text-xs text-ink-500 leading-relaxed">
+          在左侧列表点选多个条目，然后点击底部「生成分享」按钮，
+          可以一次性把所选条目（+ 可选附件）打包成单个链接交付给 AI。
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function MultiSelectBar({
+  count,
+  onShare,
+  onCancel,
+}: {
+  count: number;
+  onShare: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-40 glass rounded-2xl px-4 py-3 flex items-center gap-3 shadow-2xl">
+      <span className="text-sm">
+        已选 <span className="text-accent font-semibold">{count}</span> 项
+      </span>
+      <button
+        onClick={onShare}
+        className="bg-accent hover:bg-accent-hover text-white text-sm rounded-xl px-4 py-1.5 font-medium"
+      >
+        🔗 生成分享
+      </button>
+      <button
+        onClick={onCancel}
+        className="text-xs text-ink-400 hover:text-ink-100 px-2 py-1"
+      >
+        取消
+      </button>
+    </div>
   );
 }
 
