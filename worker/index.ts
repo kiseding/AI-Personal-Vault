@@ -9,7 +9,13 @@
 import { Hono } from "hono";
 import { logger } from "hono/logger";
 import type { AppContext } from "./env";
-import { authMiddleware, ipMiddleware } from "./middleware";
+import {
+  authMiddleware,
+  ipMiddleware,
+  securityHeaders,
+  rateLimit,
+  DEFAULT_RULES,
+} from "./middleware";
 import { entries } from "./routes/entries";
 import { vault } from "./routes/vault";
 import { attachments } from "./routes/attachments";
@@ -19,8 +25,11 @@ const app = new Hono<AppContext>();
 
 app.use("*", logger());
 
-// 所有 API 记录 IP + 鉴权（/api/ai/fetch 在中间件内放行走临时 Token）
+// 所有 API 依次经过：IP 提取 → 安全响应头 → 限流 → 鉴权
+// 安全头放在最前，确保 401/429 响应也带上 CSP/HSTS 等头
 app.use("/api/*", ipMiddleware);
+app.use("/api/*", securityHeaders());
+app.use("/api/*", rateLimit(DEFAULT_RULES));
 app.use("/api/*", authMiddleware);
 
 // 健康检查
