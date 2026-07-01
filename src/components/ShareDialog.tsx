@@ -1,63 +1,359 @@
 /**
- * 分享对话框（百度网盘模式）：链接 + 4 位提取码
+ * 分享对话框（百度网盘模式）：链接 + 提取码
  *
- * 流程：
- *  1. 浏览器解密 entry 明文 → 用提取码派生密钥 → AES-GCM 加密 → 上传密文
- *  2. 服务器只存 SHA-256(提取码) + 密文 + salt + IV（零知识）
- *  3. AI 端用提取码本地派生密钥解密
+ * 两种模式：
+ *  - 单条分享（entryId）：加密单个 entry 明文上传（feat/share-ux 后也可选择附件）
+ *  - 批量分享（entryIds + entryTitles）：解密 N 个 entry + 可选附件 → bundle JSON
+ *    → 提取码派生密钥加密 bundle → 上传
+ *
+ * feat/share-ux 改造点：
+ *  - AbortController + mounted-guard：分享生成期间用户可取消，对已 unmount 组件
+ *    setState 也会被吸收不再触发 React 警告（P1-1 / P2-1）
+ *  - 进度条 + 取消按钮：让大附件 / 批量操作的卡顿感变成可视化进度（P1-1）
+ *  - 单条分享也支持附件开关（P2-9）：server / docker 类条目通常带附件
+ *  - R2 附件下载做 1 次自动重试（P2-12），4xx 不重试
  */
-import { useState } from "react";
-import { api } from "../lib/api";
+import { useEffect, useRef, useState } from "react";
+import { api, getAppToken } from "../lib/api";
 import { session } from "../lib/session";
-import { decryptContent, encryptWithShareCode, hashShareCode } from "@/web/crypto";
+import {
+  decryptContent,
+  decryptBytes,
+  generateShareCode,
+  generateShareSalt,
+  deriveShareKey,
+  encryptWithShareKey,
+  encryptBytesWithShareKey,
+  hashShareCode,
+  encryptWithShareCode,
+  bytesToBase64,
+} from "@/web/crypto";
 
 interface ShareDialogProps {
-  entryId: string;
+  /** 单条分享：entry id */
+  entryId?: string;
+  /** 批量分享：entry id 列表 */
+  entryIds?: string[];
+  /** 批量分享：entry 标题列表（仅用于 UI 显示） */
+  entryTitles?: string[];
   onClose: () => void;
 }
 
-export function ShareDialog({ entryId, onClose }: ShareDialogProps) {
-  const [result, setResult] = useState<{
-    share_id: string;
-    code: string;
-    expires_at: string;
-    max_uses: number;
-    origin: string;
-  } | null>(null);
+interface ShareResult {
+  share_id: string;
+  code: string;
+  expires_at: string;
+  max_uses: number;
+  item_count: number;
+  origin: string;
+}
+
+// 与 worker/routes/ai.ts MAX_BUNDLE_B64 保持一致（base64 长度）
+const MAX_BUNDLE_B64 = 5 * 1024 * 1024;
+
+/**
+ * 估算一个字节流加密后的 base64 长度。
+ * AES-GCM 在 N 字节明文上输出 N+16 字节密文（GCM auth tag）；
+ * 再 base64 编码约 (N+16)/3*4 字符。
+ */
+function base64SizeOfEncrypted(plainBytes: number): number {
+  return Math.ceil((plainBytes + 16) / 3) * 4;
+}
+
+function makeAbortError(): Error {
+  const e = new Error("aborted");
+  e.name = "AbortError";
+  return e;
+}
+
+/**
+ * 带重试 + AbortSignal 感知的 fetch。
+ * - 网络错误 / 5xx 重试（maxAttempts 次，按 500ms * 步长退避）
+ * - 4xx 不重试（业务错）
+ * - signal.aborted 立即 abort
+ */
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  maxAttempts: number,
+  signal: AbortSignal,
+): Promise<Response> {
+  let lastErr: Error | null = null;
+  for (let i = 0; i < maxAttempts; i++) {
+    if (signal.aborted) throw makeAbortError();
+    try {
+      const res = await fetch(url, { ...init, signal });
+      if (!res.ok) {
+        if (res.status >= 400 && res.status < 500) {
+          // 4xx 业务错，不重试
+          throw new Error(`HTTP ${res.status}`);
+        }
+        throw new Error(`HTTP ${res.status}（可重试）`);
+      }
+      return res;
+    } catch (e) {
+      const err = e as Error;
+      if (err.name === "AbortError") throw err;
+      lastErr = err;
+      if (i === maxAttempts - 1) break;
+      // 退避
+      await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw lastErr ?? new Error("请求失败");
+}
+
+interface Progress {
+  step: string;
+  /** 0-1 完成度 */
+  ratio: number;
+}
+
+export function ShareDialog({
+  entryId,
+  entryIds,
+  entryTitles,
+  onClose,
+}: ShareDialogProps) {
+  const isBatch = !!entryIds;
+  const ids = isBatch ? entryIds! : entryId ? [entryId] : [];
+  const titleList = isBatch ? entryTitles ?? [] : [];
+  // 单条分享也支持附件：默认开启，避免 server / docker 这类条目漏附件（P2-9）
+  const [includeAttachments, setIncludeAttachments] = useState(
+    !isBatch ? true : false,
+  );
+  const [result, setResult] = useState<ShareResult | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Progress | null>(null);
+
+  const abortRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      abortRef.current?.abort();
+    };
+  }, []);
+
+  /** 设置 progress（组件 unmount 后静默忽略，避免 React 警告） */
+  const safeSet = (state: Partial<{ busy: boolean; error: string | null; progress: Progress | null; result: ShareResult | null }>) => {
+    if (!mountedRef.current) return;
+    if ("busy" in state) setBusy(state.busy!);
+    if ("error" in state) setError(state.error!);
+    if ("progress" in state) setProgress(state.progress!);
+    if ("result" in state) setResult(state.result!);
+  };
+
+  const cancel = () => {
+    abortRef.current?.abort();
+  };
 
   const generate = async () => {
-    setBusy(true);
-    setError(null);
+    if (ids.length === 0) {
+      safeSet({ error: "未选择任何条目" });
+      return;
+    }
+    const signal = (abortRef.current = new AbortController()).signal;
+    safeSet({ busy: true, error: null, result: null, progress: { step: "初始化…", ratio: 0 } });
     try {
-      const e = await api.getEntry(entryId);
-      const plain = await decryptContent(session.key(), {
-        ciphertext: e.encrypted_content,
-        iv: e.iv,
-      });
-      const { code, payload } = await encryptWithShareCode(
-        JSON.stringify({ title: e.title, fields: plain.fields, notes: plain.notes }),
+      // -------- 1) 解密所有 entry 明文 --------
+      const items: Array<{
+        entry_id: string;
+        title: string;
+        type: string;
+        tags: string[];
+        fields: Record<string, string>;
+        notes: string;
+      }> = [];
+      let estimatedB64 = 0;
+      for (let i = 0; i < ids.length; i++) {
+        if (signal.aborted) throw makeAbortError();
+        const e = await api.getEntry(ids[i]);
+        const plain = await decryptContent(session.key(), {
+          ciphertext: e.encrypted_content,
+          iv: e.iv,
+        });
+        items.push({
+          entry_id: ids[i],
+          title: e.title,
+          type: e.type,
+          tags: e.tags,
+          fields: plain.fields,
+          notes: plain.notes,
+        });
+        estimatedB64 +=
+          ids[i].length + e.title.length + JSON.stringify(plain).length + 200;
+        safeSet({
+          progress: {
+            step: `解密 entry ${i + 1}/${ids.length}`,
+            ratio: (i + 1) / (ids.length * (includeAttachments ? 4 : 2)),
+          },
+        });
+        if (estimatedB64 > MAX_BUNDLE_B64) {
+          throw new Error(
+            `条目总大小超过 ${MAX_BUNDLE_B64 / 1024 / 1024}MB 上限，请减少批量`,
+          );
+        }
+      }
+
+      // -------- 2) 收集附件（可选） --------
+      const files: Array<{
+        name: string;
+        mime: string;
+        size: number;
+        ciphertext: string;
+        iv: string;
+        __plaintext?: Uint8Array;
+      }> = [];
+      if (includeAttachments) {
+        const token = getAppToken();
+        for (let i = 0; i < ids.length; i++) {
+          if (signal.aborted) throw makeAbortError();
+          const atts = await api.listAttachments(ids[i]);
+          for (const att of atts) {
+            if (signal.aborted) throw makeAbortError();
+            safeSet({
+              progress: {
+                step: `下载并解密 ${att.name}`,
+                ratio: 0.4 + (i / ids.length) * 0.2,
+              },
+            });
+            // 走带重试的 fetch
+            const res = await fetchWithRetry(
+              `/api/attachments/${att.id}`,
+              {
+                headers: token ? { Authorization: `Bearer ${token}` } : {},
+              },
+              2,
+              signal,
+            );
+            const iv = res.headers.get("X-Attachment-IV") ?? "";
+            const size = Number(res.headers.get("X-Attachment-Size") ?? 0);
+            const disposition = res.headers.get("Content-Disposition") ?? "";
+            const nameMatch = disposition.match(/filename="([^"]+)"/);
+            const name = nameMatch ? decodeURIComponent(nameMatch[1]) : att.name;
+            const mime = res.headers.get("Content-Type") ?? att.mime;
+            const ciphertext = new Uint8Array(await res.arrayBuffer());
+            const plain = await decryptBytes(session.key(), {
+              ciphertext: bytesToBase64(ciphertext),
+              iv,
+            });
+            estimatedB64 += base64SizeOfEncrypted(plain.length);
+            if (estimatedB64 > MAX_BUNDLE_B64) {
+              throw new Error(
+                `附件累计超过 ${MAX_BUNDLE_B64 / 1024 / 1024}MB 上限`,
+              );
+            }
+            files.push({
+              name,
+              mime,
+              size,
+              __plaintext: plain,
+            });
+          }
+        }
+      }
+
+      // -------- 3) 单条分享走旧路径 --------
+      if (!isBatch) {
+        const item = items[0];
+        const singleText = JSON.stringify({
+          title: item.title,
+          fields: item.fields,
+          notes: item.notes,
+        });
+        safeSet({ progress: { step: "加密正文…", ratio: 0.7 } });
+        const { code, payload } = await encryptWithShareCode(singleText);
+        const codeHash = await hashShareCode(code);
+        safeSet({ progress: { step: "上传…", ratio: 0.9 } });
+        const r = await api.createShare({
+          entry_id: ids[0],
+          ciphertext: payload.ciphertext,
+          iv: payload.iv,
+          salt: payload.salt,
+          code_hash: codeHash,
+        });
+        safeSet({
+          progress: { step: "完成", ratio: 1 },
+          result: {
+            share_id: r.share_id,
+            code,
+            expires_at: r.expires_at,
+            max_uses: r.max_uses,
+            item_count: r.item_count,
+            origin: window.location.origin,
+          },
+          busy: false,
+        });
+        return;
+      }
+
+      // -------- 4) 批量分享：派生 share key + 加密 --------
+      safeSet({ progress: { step: "生成提取码与密钥…", ratio: 0.7 } });
+      const code = generateShareCode();
+      const salt = generateShareSalt();
+      const shareKey = await deriveShareKey(code, salt);
+
+      const fileMetas: Array<{
+        name: string;
+        mime: string;
+        size: number;
+        ciphertext: string;
+        iv: string;
+      }> = [];
+      for (const f of files) {
+        if (signal.aborted) throw makeAbortError();
+        safeSet({ progress: { step: `重新加密附件 ${f.name}`, ratio: 0.75 } });
+        const enc = await encryptBytesWithShareKey(f.__plaintext!, shareKey);
+        fileMetas.push({
+          name: f.name,
+          mime: f.mime,
+          size: f.size,
+          ciphertext: enc.ciphertext,
+          iv: enc.iv,
+        });
+        // 及时释放明文（best-effort，参见 PR 8 进一步讨论）
+        f.__plaintext = undefined;
+      }
+
+      const bundle = { version: 2, items, files: fileMetas };
+      safeSet({ progress: { step: "加密 bundle…", ratio: 0.85 } });
+      const bundleEnc = await encryptWithShareKey(
+        JSON.stringify(bundle),
+        shareKey,
       );
+
+      safeSet({ progress: { step: "上传…", ratio: 0.95 } });
       const codeHash = await hashShareCode(code);
       const r = await api.createShare({
-        entry_id: entryId,
-        ciphertext: payload.ciphertext,
-        iv: payload.iv,
-        salt: payload.salt,
+        entry_ids: ids,
+        ciphertext: bundleEnc.ciphertext,
+        iv: bundleEnc.iv,
+        salt,
         code_hash: codeHash,
+        files: fileMetas,
       });
-      setResult({
-        share_id: r.share_id,
-        code,
-        expires_at: r.expires_at,
-        max_uses: r.max_uses,
-        origin: window.location.origin,
+
+      safeSet({
+        progress: { step: "完成", ratio: 1 },
+        result: {
+          share_id: r.share_id,
+          code,
+          expires_at: r.expires_at,
+          max_uses: r.max_uses,
+          item_count: r.item_count,
+          origin: window.location.origin,
+        },
+        busy: false,
       });
     } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
+      const err = e as Error;
+      if (err.name === "AbortError") {
+        safeSet({ busy: false, progress: null });
+        return; // 不显示错误——用户主动取消
+      }
+      safeSet({ busy: false, error: err.message, progress: null });
     }
   };
 
@@ -80,7 +376,9 @@ export function ShareDialog({ entryId, onClose }: ShareDialogProps) {
       >
         {/* 头部 */}
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold">分享给 AI</h2>
+          <h2 className="text-lg font-semibold">
+            {isBatch ? `分享 ${ids.length} 条给 AI` : "分享给 AI"}
+          </h2>
           <button
             onClick={onClose}
             className="w-9 h-9 flex items-center justify-center rounded-xl hover:bg-white/10 text-lg"
@@ -92,37 +390,102 @@ export function ShareDialog({ entryId, onClose }: ShareDialogProps) {
 
         {!result ? (
           <div className="space-y-3">
+            {/* 批量条目预览 */}
+            {isBatch && (
+              <div className="glass rounded-xl p-3 max-h-48 overflow-y-auto space-y-1">
+                {titleList.map((t, i) => (
+                  <div key={i} className="text-sm flex items-center gap-2">
+                    <span className="text-ink-500 text-xs">{i + 1}.</span>
+                    <span className="truncate">{t}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             <p className="text-sm text-ink-300">
-              生成一个临时分享链接 + 4 位提取码。AI 用此链接获取密文，再用提取码本地解密。
+              生成一个临时分享链接 + 提取码。AI 用此链接获取密文，再用提取码本地解密。
             </p>
+
+            {/* 附件开关：单条 / 批量都显示 */}
+            <label className="flex items-start gap-3 p-3 rounded-xl bg-white/5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeAttachments}
+                onChange={(e) => setIncludeAttachments(e.target.checked)}
+                className="mt-1"
+              />
+              <div className="text-xs text-ink-300 space-y-1 leading-relaxed">
+                <div className="text-ink-100 font-medium">包含附件</div>
+                <div>
+                  浏览器会下载所有附件并解密 → 用 share key 重加密后嵌入 bundle。
+                </div>
+                <div className="text-ink-500">
+                  bundle 明文上限约 {MAX_BUNDLE_B64 / 1024 / 1024}MB
+                </div>
+              </div>
+            </label>
+
             <div className="text-xs text-ink-500 space-y-1 leading-relaxed">
               <div>• 链接 5 分钟内有效</div>
-              <div>• 最多提取 5 次（防爆破）</div>
+              <div>• 最多提取 3 次（防爆破）</div>
               <div>• 提取码仅存在你的浏览器，服务器只存 SHA-256 哈希</div>
               <div>• 零知识：服务器永远不知道明文密码</div>
             </div>
+
             {error && (
               <div className="text-xs text-red-400 bg-red-500/10 rounded-lg px-3 py-2">
                 {error}
               </div>
             )}
+
+            {/* 进度条 + 取消按钮 */}
+            {busy && progress && (
+              <div className="space-y-2">
+                <div className="h-1.5 bg-white/10 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-accent transition-all duration-200"
+                    style={{ width: `${Math.min(100, progress.ratio * 100)}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="text-xs text-ink-400 truncate flex-1">
+                    {progress.step}
+                  </div>
+                  <button
+                    onClick={cancel}
+                    className="text-xs text-red-400 hover:text-red-300 px-2 py-0.5"
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
             <button
               onClick={generate}
               disabled={busy}
               className="w-full bg-accent hover:bg-accent-hover disabled:opacity-50 text-white rounded-xl py-3 text-sm font-medium transition-colors"
             >
-              {busy ? "生成中…" : "生成分享"}
+              {busy
+                ? "处理中…"
+                : isBatch
+                  ? `生成分享（${ids.length} 条）`
+                  : "生成分享"}
             </button>
           </div>
         ) : (
           <div className="space-y-4">
             <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-xl p-3 text-xs text-emerald-300">
-              ✓ 分享已生成，链接 5 分钟内有效，最多 5 次提取
+              ✓{" "}
+              {result.item_count > 1
+                ? `批量分享（${result.item_count} 条）已生成`
+                : "分享已生成"}
+              ，链接 {new Date(result.expires_at).toLocaleTimeString()} 前有效，最多{" "}
+              {result.max_uses} 次提取
             </div>
 
-            {/* 提取码 */}
             <div className="text-center py-4 bg-ink-900/60 rounded-xl">
-              <div className="text-xs text-ink-400 mb-2">提取码（4 位）</div>
+              <div className="text-xs text-ink-400 mb-2">提取码（6 位）</div>
               <div className="text-4xl font-mono font-bold text-emerald-400 tracking-widest">
                 {result.code}
               </div>
@@ -134,7 +497,6 @@ export function ShareDialog({ entryId, onClose }: ShareDialogProps) {
               </button>
             </div>
 
-            {/* 链接 */}
             <div className="space-y-1.5">
               <div className="text-xs text-ink-400">分享链接</div>
               <div className="bg-ink-900/60 rounded-lg p-2.5 text-xs text-ink-200 break-all font-mono">
@@ -150,7 +512,6 @@ export function ShareDialog({ entryId, onClose }: ShareDialogProps) {
               </button>
             </div>
 
-            {/* AI curl 示例 */}
             <div className="space-y-1.5 border-t border-white/5 pt-3">
               <div className="text-xs text-ink-400">AI 端调用示例</div>
               <div className="bg-ink-900/60 rounded-lg p-2.5 text-[11px] text-ink-300 break-all font-mono leading-relaxed">
@@ -168,7 +529,6 @@ export function ShareDialog({ entryId, onClose }: ShareDialogProps) {
               </button>
             </div>
 
-            {/* 重新生成 */}
             <button
               onClick={() => setResult(null)}
               className="w-full text-sm text-ink-400 hover:text-ink-100 py-2"
