@@ -1,6 +1,20 @@
 /**
  * 主界面：侧栏导航（第九章）+ 列表 + 详情查看
  * 正文搜索在浏览器本地完成（第十一章：服务器不能搜索正文）
+ *
+ * 多选分享（0003 迁移）：
+ *  - 侧栏点 📦 多选 → 进入多选模式（列表项左侧显示 checkbox）
+ *  - 勾选 N 个条目 → 顶部出现选择工具栏（全选 / 反选 / 取消选择）
+ *  - 点"生成分享" → 打开 ShareDialog 的批量模式
+ *
+ * feat/ux-polish：
+ *  - P2-2 selectedIds 自动清理：列表条目消失时同步从勾选集合移除，
+ *    避免删除某条后仍处于勾选状态导致服务端 404
+ *  - P2-5 filter 用具体字段（filterKind / filterType）做依赖，
+ *    替代之前 JSON.stringify(filter) 这种字符串化 hack
+ *  - P2-7 多选顶部加入全选 / 反选 / 取消开关，操作大列表更快
+ *  - P2-4 MultiSelectBar / 进度浮窗底部加入 safe-area-inset，
+ *    iOS Safari 的 home indicator 不再遮挡
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
@@ -46,46 +60,68 @@ export function Vault() {
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<"vault" | "shares">("vault");
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  // 移动端：列表 ↔ 详情 全屏切换（桌面端忽略）
   const [mobileView, setMobileView] = useState<"list" | "detail">("list");
+
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [batchShareOpen, setBatchShareOpen] = useState(false);
+
+  // P2-5：拆解 filter 字段做依赖，避开 JSON.stringify 这种字符串化 hack
+  const filterKind = filter.kind;
+  const filterType = filter.kind === "type" ? filter.type : null;
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       let list: Entry[];
-      if (filter.kind === "favorite")
-        list = await api.listEntries({ favorite: true });
-      else if (filter.kind === "trashed")
-        list = await api.listEntries({ trashed: true });
-      else if (filter.kind === "type")
-        list = await api.listEntries({ type: filter.type });
-      else list = await api.listEntries();
-      // 「最近」按 updated_at 已排序
+      switch (filterKind) {
+        case "favorite":
+          list = await api.listEntries({ favorite: true });
+          break;
+        case "trashed":
+          list = await api.listEntries({ trashed: true });
+          break;
+        case "type":
+          list = await api.listEntries({ type: filterType! });
+          break;
+        default:
+          list = await api.listEntries();
+      }
       setEntries(list);
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [JSON.stringify(filter)]);
+  }, [filterKind, filterType]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  // 监听侧栏的 filter 切换事件（解耦，避免 prop drilling）
+  // P2-2：列表刷新后清理已不存在的 ID，避免「条目被删但仍勾选」导致 ShareDialog 404
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const valid = new Set<string>();
+      const entryIds = new Set(entries.map((e) => e.id));
+      for (const id of prev) if (entryIds.has(id)) valid.add(id);
+      return valid.size === prev.size ? prev : valid;
+    });
+  }, [entries]);
+
   useEffect(() => {
     const filterHandler = (e: Event) => {
       const detail = (e as CustomEvent<Filter>).detail;
       setFilter(detail);
       setSelectedId(null);
+      setMultiSelectMode(false);
+      setSelectedIds(new Set());
     };
     const newHandler = () => setEditing("new");
     const lockHandler = () => {
       session.lock();
-      // 通知 App 重新渲染为 Auth
       window.dispatchEvent(new Event("app:lock"));
     };
     window.addEventListener("vault:set-filter", filterHandler);
@@ -113,7 +149,56 @@ export function Vault() {
     [entries, selectedId],
   );
 
+  // 多选时整列表的 ID（用于"全选"）
+  const allSelectableIds = useMemo(
+    () => filtered.map((e) => e.id),
+    [filtered],
+  );
+
   const refresh = () => void load();
+
+  const toggleMultiSelectMode = () => {
+    if (multiSelectMode) {
+      setMultiSelectMode(false);
+      setSelectedIds(new Set());
+    } else {
+      setMultiSelectMode(true);
+      setSelectedId(null);
+      setSelectedIds(new Set());
+    }
+  };
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  // P2-7：多选顶部工具栏操作
+  const selectAll = () =>
+    setSelectedIds(new Set(allSelectableIds));
+  const invertSelection = () => {
+    setSelectedIds((prev) => {
+      const next = new Set<string>();
+      for (const id of allSelectableIds) {
+        if (!prev.has(id)) next.add(id);
+      }
+      return next;
+    });
+  };
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const handleItemClick = (e: Entry) => {
+    if (multiSelectMode) {
+      toggleSelect(e.id);
+    } else {
+      setSelectedId(e.id);
+      setMobileView("detail");
+    }
+  };
 
   if (editing) {
     return (
@@ -131,6 +216,8 @@ export function Vault() {
         <Sidebar
           view={view}
           onChangeView={setView}
+          multiSelectMode={multiSelectMode}
+          onToggleMultiSelect={toggleMultiSelectMode}
           mobileOpen={mobileNavOpen}
           onCloseMobile={() => setMobileNavOpen(false)}
         />
@@ -141,15 +228,15 @@ export function Vault() {
 
   return (
     <div className="flex h-screen">
-      {/* 侧栏 */}
       <Sidebar
         view={view}
         onChangeView={setView}
+        multiSelectMode={multiSelectMode}
+        onToggleMultiSelect={toggleMultiSelectMode}
         mobileOpen={mobileNavOpen}
         onCloseMobile={() => setMobileNavOpen(false)}
       />
 
-      {/* 列表（移动端：详情页时整列隐藏；桌面端始终显示） */}
       <section
         className={
           mobileView === "detail"
@@ -158,7 +245,6 @@ export function Vault() {
         }
       >
         <div className="p-3 flex items-center gap-2">
-          {/* 移动端汉堡菜单 */}
           <button
             onClick={() => setMobileNavOpen(true)}
             className="sm:hidden w-9 h-9 flex items-center justify-center rounded-xl hover:bg-white/10"
@@ -173,6 +259,36 @@ export function Vault() {
             className="flex-1 bg-ink-900/80 border border-white/10 rounded-xl px-3 py-2 text-sm outline-none focus:border-accent"
           />
         </div>
+        {/* P2-7：多选模式工具栏（全选 / 反选 / 取消）*/}
+        {multiSelectMode && (
+          <div className="px-3 pb-2 flex flex-wrap items-center gap-1.5 text-xs">
+            <span className="text-accent font-medium">
+              📦 已选 {selectedIds.size} / {filtered.length}
+            </span>
+            <div className="flex-1" />
+            <button
+              className="text-ink-400 hover:text-ink-100 px-2 py-0.5"
+              onClick={selectAll}
+              title="全选当前可见列表"
+            >
+              全选
+            </button>
+            <button
+              className="text-ink-400 hover:text-ink-100 px-2 py-0.5"
+              onClick={invertSelection}
+              title="反选当前可见列表"
+            >
+              反选
+            </button>
+            <button
+              className="text-ink-400 hover:text-ink-100 px-2 py-0.5"
+              onClick={clearSelection}
+              title="清空已选"
+            >
+              清空
+            </button>
+          </div>
+        )}
         <div className="flex-1 overflow-y-auto px-2 pb-4">
           {loading && (
             <div className="text-center text-sm text-ink-500 py-8">加载中…</div>
@@ -187,17 +303,14 @@ export function Vault() {
             <ListItem
               key={e.id}
               entry={e}
-              active={e.id === selectedId}
-              onClick={() => {
-                setSelectedId(e.id);
-                setMobileView("detail");
-              }}
+              active={multiSelectMode ? selectedIds.has(e.id) : e.id === selectedId}
+              multiSelectMode={multiSelectMode}
+              onClick={() => handleItemClick(e)}
             />
           ))}
         </div>
       </section>
 
-      {/* 详情（移动端：列表页时整块隐藏；桌面端始终显示） */}
       <main
         className={
           mobileView === "list"
@@ -205,7 +318,9 @@ export function Vault() {
             : "flex sm:flex flex-1 overflow-y-auto"
         }
       >
-        {selected ? (
+        {multiSelectMode ? (
+          <MultiSelectEmpty total={filtered.length} selected={selectedIds.size} />
+        ) : selected ? (
           <EntryDetail
             entry={selected}
             onEdit={() => setEditing(selected)}
@@ -224,36 +339,51 @@ export function Vault() {
           </div>
         )}
       </main>
+
+      {multiSelectMode && selectedIds.size > 0 && (
+        <MultiSelectBar
+          count={selectedIds.size}
+          onShare={() => setBatchShareOpen(true)}
+          onCancel={toggleMultiSelectMode}
+        />
+      )}
+
+      {batchShareOpen && (
+        <ShareDialog
+          entryIds={Array.from(selectedIds)}
+          entryTitles={entries
+            .filter((e) => selectedIds.has(e.id))
+            .map((e) => e.title)}
+          onClose={() => setBatchShareOpen(false)}
+        />
+      )}
     </div>
   );
 }
 
-/**
- * 侧栏（移动端为 drawer，桌面端为常驻）
- */
 function Sidebar({
   view,
   onChangeView,
+  multiSelectMode,
+  onToggleMultiSelect,
   mobileOpen,
   onCloseMobile,
 }: {
   view: "vault" | "shares";
   onChangeView: (v: "vault" | "shares") => void;
+  multiSelectMode: boolean;
+  onToggleMultiSelect: () => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
 }) {
   const [filter, setFilterLocal] = useState<Filter>({ kind: "all" });
-  // 同步当前 vault filter 到全局（仅在 vault view 下有效）
-  // 这里复用外部的 filter 较复杂，简化为 Sidebar 内部点击会触发一个事件
 
-  // 移动端 drawer
   const drawerClasses = mobileOpen
     ? "fixed inset-y-0 left-0 z-40 w-72 sm:relative sm:inset-auto sm:z-auto sm:w-60 sm:shrink-0"
     : "hidden sm:flex sm:w-60 sm:shrink-0";
 
   return (
     <>
-      {/* 移动端 backdrop */}
       {mobileOpen && (
         <div
           className="fixed inset-0 z-30 bg-black/50 sm:hidden"
@@ -276,7 +406,6 @@ function Sidebar({
             >
               锁定
             </button>
-            {/* 移动端关闭按钮 */}
             <button
               onClick={onCloseMobile}
               className="sm:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/10"
@@ -299,6 +428,21 @@ function Sidebar({
         >
           + 新建
         </button>
+        {view === "vault" && (
+          <button
+            onClick={() => {
+              onToggleMultiSelect();
+              onCloseMobile();
+            }}
+            className={`mx-3 mb-2 text-sm rounded-xl py-2 transition-colors flex items-center justify-center gap-2 ${
+              multiSelectMode
+                ? "bg-accent/15 text-accent border border-accent/40"
+                : "bg-white/5 text-ink-200 hover:bg-white/10"
+            }`}
+          >
+            📦 {multiSelectMode ? "退出多选" : "多选分享"}
+          </button>
+        )}
         <nav className="flex-1 overflow-y-auto px-2 pb-4 space-y-0.5">
           {view === "vault" && (
             <>
@@ -308,7 +452,6 @@ function Sidebar({
                   active={JSON.stringify(item.filter) === JSON.stringify(filter)}
                   onClick={() => {
                     setFilterLocal(item.filter);
-                    // 通过 window 自定义事件通知 Vault 切换 filter
                     window.dispatchEvent(
                       new CustomEvent("vault:set-filter", { detail: item.filter }),
                     );
@@ -378,10 +521,12 @@ function NavBtn({
 function ListItem({
   entry,
   active,
+  multiSelectMode,
   onClick,
 }: {
   entry: Entry;
   active: boolean;
+  multiSelectMode: boolean;
   onClick: () => void;
 }) {
   const meta = ENTRY_TYPE_META[entry.type];
@@ -393,6 +538,17 @@ function ListItem({
       }`}
     >
       <div className="flex items-center gap-2">
+        {multiSelectMode && (
+          <span
+            className={`w-4 h-4 rounded border flex items-center justify-center text-[10px] shrink-0 ${
+              active
+                ? "bg-accent border-accent text-white"
+                : "border-white/30"
+            }`}
+          >
+            {active ? "✓" : ""}
+          </span>
+        )}
         <span className="text-lg">{entry.icon ?? meta.icon}</span>
         <span className="flex-1 truncate text-sm font-medium">{entry.title}</span>
         {entry.favorite && <span className="text-amber-400 text-xs">★</span>}
@@ -409,6 +565,69 @@ function ListItem({
         ))}
       </div>
     </button>
+  );
+}
+
+function MultiSelectEmpty({
+  total,
+  selected,
+}: {
+  total: number;
+  selected: number;
+}) {
+  return (
+    <div className="h-full flex items-center justify-center text-ink-600">
+      <div className="text-center space-y-3 max-w-sm px-6">
+        <div className="text-5xl">📦</div>
+        <p className="text-sm">多选模式已开启</p>
+        <p className="text-xs text-ink-500 leading-relaxed">
+          在左侧列表点选多个条目，然后点击底部「生成分享」按钮，
+          可以一次性把所选条目（+ 可选附件）打包成单个链接交付给 AI。
+        </p>
+        <p className="text-xs text-ink-500">
+          当前可见 <span className="text-ink-300">{total}</span> 条，已选{" "}
+          <span className="text-accent">{selected}</span> 条
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 浮动操作栏（P2-4：底部 padding 留出 iOS home indicator）
+ */
+function MultiSelectBar({
+  count,
+  onShare,
+  onCancel,
+}: {
+  count: number;
+  onShare: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed left-1/2 -translate-x-1/2 z-40 glass rounded-2xl px-4 py-3 flex items-center gap-3 shadow-2xl"
+      style={{
+        bottom: "max(1rem, env(safe-area-inset-bottom))",
+      }}
+    >
+      <span className="text-sm">
+        已选 <span className="text-accent font-semibold">{count}</span> 项
+      </span>
+      <button
+        onClick={onShare}
+        className="bg-accent hover:bg-accent-hover text-white text-sm rounded-xl px-4 py-1.5 font-medium"
+      >
+        🔗 生成分享
+      </button>
+      <button
+        onClick={onCancel}
+        className="text-xs text-ink-400 hover:text-ink-100 px-2 py-1"
+      >
+        取消
+      </button>
+    </div>
   );
 }
 
@@ -450,6 +669,17 @@ function EntryDetail({
     };
   }, [entry.id, entry.encrypted_content, entry.iv]);
 
+  // feat/perf：锁定时立即清空已解密的明文（最佳努力内存清理）
+  useEffect(() => {
+    const onLock = () => {
+      setContent(null);
+      setError(null);
+      setLoading(false);
+    };
+    window.addEventListener("app:lock", onLock);
+    return () => window.removeEventListener("app:lock", onLock);
+  }, []);
+
   const meta = ENTRY_TYPE_META[entry.type];
 
   const handleDelete = async () => {
@@ -465,7 +695,6 @@ function EntryDetail({
 
   return (
     <div className="max-w-2xl mx-auto p-4 sm:p-8 space-y-6">
-      {/* 移动端返回按钮 */}
       {onBack && (
         <button
           onClick={onBack}
@@ -494,6 +723,11 @@ function EntryDetail({
                   {t}
                 </span>
               ))}
+            </div>
+          )}
+          {content && content.attachment_ids && content.attachment_ids.length > 0 && (
+            <div className="text-xs text-ink-500 mt-2">
+              📎 {content.attachment_ids.length} 个附件
             </div>
           )}
         </div>
