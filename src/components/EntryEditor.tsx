@@ -1,6 +1,9 @@
 /**
  * Entry 编辑器：按类型模板编辑字段 + 标签 + AI 授权（第七/十/十五章）
  * 保存前在浏览器加密，服务器只接收密文。
+ *
+ * feat/ux-polish (P2-8)：每个 Field 字段透传 `inputMode` 和 `autoComplete`，
+ * 让移动端键盘按字段类型弹出（数字 / 邮箱 / URL / 电话），并启用自动填充。
  */
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
@@ -68,10 +71,16 @@ export function EntryEditor({
     if (!title.trim()) return setError("请输入标题");
     setLoading(true);
     try {
+      // 取现有附件 ID（让 attachment_ids 字段与 attachments 表保持一致 —— P2-3）
+      let attachmentIds: string[] = [];
+      if (entry) {
+        const atts = await api.listAttachments(entry.id);
+        attachmentIds = atts.map((a) => a.id);
+      }
       const content: EntryContent = {
         fields,
         notes,
-        attachment_ids: [],
+        attachment_ids: attachmentIds,
       };
       const enc = await encryptContent(session.key(), content);
       if (entry) {
@@ -178,7 +187,7 @@ export function EntryEditor({
           placeholder="给这个条目起个名字"
         />
 
-        {/* 模板字段 */}
+        {/* 模板字段（feat/ux-polish: inputMode / autoComplete 透传） */}
         <div className="space-y-3">
           {template.map((f) => (
             <Field
@@ -189,6 +198,8 @@ export function EntryEditor({
               type={f.type === "password" || f.type === "secret" ? "password" : "text"}
               multiline={f.type === "multiline" || f.type === "textarea" || f.type === "markdown"}
               placeholder={f.placeholder}
+              inputMode={f.inputMode}
+              autoComplete={f.autoComplete}
             />
           ))}
         </div>
@@ -238,7 +249,7 @@ export function EntryEditor({
           />
         </div>
 
-        {/* AI 授权（第十五章） */}
+        {/* AI 授权 */}
         {entry && (
           <div>
             <button
@@ -362,6 +373,11 @@ function AiPanel({ entryId }: { entryId: string }) {
   );
 }
 
+/**
+ * 通用 Field（feat/ux-polish：透传 inputMode + autoComplete）
+ * - inputMode：移动端决定弹哪种键盘
+ * - autoComplete：浏览器 / 1Password 自动填充
+ */
 function Field({
   label,
   value,
@@ -369,6 +385,8 @@ function Field({
   type = "text",
   placeholder,
   multiline,
+  inputMode,
+  autoComplete,
 }: {
   label: string;
   value: string;
@@ -376,6 +394,8 @@ function Field({
   type?: string;
   placeholder?: string;
   multiline?: boolean;
+  inputMode?: React.InputHTMLAttributes<HTMLInputElement>["inputMode"];
+  autoComplete?: string;
 }) {
   return (
     <label className="block space-y-1.5">
@@ -386,11 +406,14 @@ function Field({
           placeholder={placeholder}
           onChange={(e) => onChange(e.target.value)}
           rows={5}
+          autoComplete={autoComplete}
           className="w-full bg-ink-900/80 border border-white/10 rounded-xl px-3.5 py-2.5 text-sm outline-none focus:border-accent font-mono"
         />
       ) : (
         <input
           type={type}
+          inputMode={inputMode}
+          autoComplete={autoComplete}
           value={value}
           placeholder={placeholder}
           onChange={(e) => onChange(e.target.value)}
