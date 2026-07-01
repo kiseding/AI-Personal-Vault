@@ -1,14 +1,14 @@
 /**
- * AI Personal Vault - 浏览器端零知识加密层（第四章「安全要求」）
+ * AI Personal Vault - 浏览器端加密层（第四章「安全要求」）
  *
- * 核心原则：
- * - 主密码永远不上传服务器，刷新页面后立即从内存消失
- * - 密钥派生使用 PBKDF2-SHA256（高迭代 60 万次，Web Crypto 原生）
- *   Argon2id 为更优方案，但需独立 WASM 库；当前以 PBKDF2 为零依赖兼容实现
- * - 正文加密使用 AES-GCM 256，每次随机 12 字节 IV
- * - 全部使用 Web Crypto API，不自行实现密码学算法
+ * feat/perf: 600K 次 PBKDF2 派生迁到 crypto.worker（P0-1），
+ * 主线程不再被 1-5s 的派生阻塞；移动端解锁体验显著改善。
  *
- * 服务器永远只能看到密文。
+ * 其它加密操作（AES-GCM）继续在主线程 —— 它足够快，不值得引入 worker
+ * round-trip 延迟。
+ *
+ * 其它功能不变：分享提取码 6 位（feat/mobile-hardening）、
+ * 批量分享复用 share key（feat/batch-share）、AES-GCM 256 / PBKDF2 600k。
  */
 
 import type { EntryContent } from "@/shared/types";
@@ -16,10 +16,10 @@ import type { EntryContent } from "@/shared/types";
 // ----------------------------------------------------------------------------
 // 常量
 // ----------------------------------------------------------------------------
-const PBKDF2_ITERATIONS = 600_000; // OWASP 2023 推荐下限
-const SALT_LENGTH = 16; // 字节
-const IV_LENGTH = 12; // AES-GCM 推荐 96 位
-const KEY_LENGTH = 256; // 位
+const SHARE_PBKDF2_ITERATIONS = 100_000; // 4-6 位提取码派生（码空间小，需高迭代防爆破）
+const SALT_LENGTH = 16;
+const IV_LENGTH = 12;
+const KEY_LENGTH = 256;
 
 // ----------------------------------------------------------------------------
 // Base64 <-> Uint8Array 工具
@@ -31,7 +31,6 @@ export function bytesToBase64(bytes: Uint8Array): string {
   return btoa(bin);
 }
 
-/** 返回 ArrayBuffer 支持的 Uint8Array（TS 5.7 BufferSource 兼容） */
 export function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -39,7 +38,6 @@ export function base64ToBytes(b64: string): Uint8Array<ArrayBuffer> {
   return out;
 }
 
-/** 把任意 Uint8Array 转为 ArrayBuffer，确保可赋给 Web Crypto 的 BufferSource */
 function toArrayBuffer(u: Uint8Array): ArrayBuffer {
   if (u.byteOffset === 0 && u.byteLength === u.buffer.byteLength) {
     return u.buffer as ArrayBuffer;
@@ -48,7 +46,7 @@ function toArrayBuffer(u: Uint8Array): ArrayBuffer {
 }
 
 // ----------------------------------------------------------------------------
-// Salt 生成（账号级，明文存服务器）
+// Salt 生成
 // ----------------------------------------------------------------------------
 export function generateSalt(): string {
   const salt = crypto.getRandomValues(new Uint8Array(SALT_LENGTH));
@@ -56,45 +54,96 @@ export function generateSalt(): string {
 }
 
 // ----------------------------------------------------------------------------
-// 主密钥派生：主密码 + salt → AES-GCM CryptoKey（PBKDF2-SHA256）
+// 主密钥派生（feat/perf: 迁到 Worker，60 万次 PBKDF2 不再阻塞主线程）
 // ----------------------------------------------------------------------------
+type PendingCb = {
+  resolve: (raw: ArrayBuffer) => void;
+  reject: (e: Error) => void;
+};
+let _worker: Worker | null = null;
+let _workerReady: Promise<Worker> | null = null;
+let _nextId = 0;
+const _pending = new Map<number, PendingCb>();
+
+function getCryptoWorker(): Promise<Worker> {
+  if (!_workerReady) {
+    _workerReady = new Promise<Worker>((resolve, reject) => {
+      try {
+        const w = new Worker(
+          new URL("./crypto.worker.ts", import.meta.url),
+          { type: "module" },
+        );
+        w.onmessage = (e: MessageEvent) => {
+          const msg = e.data as {
+            id: number;
+            ok: boolean;
+            raw?: ArrayBuffer;
+            error?: string;
+          };
+          const p = _pending.get(msg.id);
+          if (!p) return; // 已超时或取消
+          _pending.delete(msg.id);
+          if (msg.ok && msg.raw) {
+            p.resolve(msg.raw);
+          } else {
+            p.reject(new Error(msg.error ?? "worker error"));
+          }
+        };
+        w.onerror = (e) => {
+          const msg = `crypto worker error: ${e.message}`;
+          for (const [, p] of _pending) p.reject(new Error(msg));
+          _pending.clear();
+          reject(new Error(msg));
+        };
+        _worker = w;
+        resolve(w);
+      } catch (e) {
+        reject(e as Error);
+      }
+    });
+  }
+  return _workerReady;
+}
+
 export async function deriveMasterKey(
   password: string,
   saltB64: string,
 ): Promise<CryptoKey> {
-  const salt = base64ToBytes(saltB64);
-  const keyMaterial = await crypto.subtle.importKey(
+  const w = await getCryptoWorker();
+  const id = ++_nextId;
+  const raw = await new Promise<ArrayBuffer>((resolve, reject) => {
+    _pending.set(id, { resolve, reject });
+    w.postMessage({
+      id,
+      type: "deriveMasterKey",
+      payload: { password, saltB64 },
+    });
+  });
+  // 把 raw 字节导入为非 extractable AES-GCM key。raw buffer 立即覆写随机数据
+  // 防止后续被内存分析读到。导出回主线程的窗口约数毫秒，是该方案的主要权衡。
+  const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveKey"],
-  );
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: toArrayBuffer(salt), iterations: PBKDF2_ITERATIONS, hash: "SHA-256" },
-    keyMaterial,
+    raw,
     { name: "AES-GCM", length: KEY_LENGTH },
     false,
     ["encrypt", "decrypt"],
   );
+  crypto.getRandomValues(new Uint8Array(raw));
+  return key;
 }
 
 // ----------------------------------------------------------------------------
 // AES-GCM 加解密原语
 // ----------------------------------------------------------------------------
 export interface EncryptedPayload {
-  /** base64 密文 */
   ciphertext: string;
-  /** base64 IV */
   iv: string;
 }
 
-/** 生成随机 IV（base64） */
 export function generateIv(): string {
   return bytesToBase64(crypto.getRandomValues(new Uint8Array(IV_LENGTH)));
 }
 
-/** 加密字符串 */
 export async function encryptString(
   key: CryptoKey,
   plaintext: string,
@@ -109,7 +158,6 @@ export async function encryptString(
   return { ciphertext: bytesToBase64(new Uint8Array(ct)), iv: bytesToBase64(iv) };
 }
 
-/** 解密字符串 */
 export async function decryptString(
   key: CryptoKey,
   payload: EncryptedPayload,
@@ -125,7 +173,7 @@ export async function decryptString(
 }
 
 // ----------------------------------------------------------------------------
-// Entry 正文加解密（结构化字段序列化为 JSON 后加密）
+// Entry 正文 / 附件
 // ----------------------------------------------------------------------------
 export async function encryptContent(
   key: CryptoKey,
@@ -142,9 +190,6 @@ export async function decryptContent(
   return JSON.parse(json) as EntryContent;
 }
 
-// ----------------------------------------------------------------------------
-// 附件（二进制）加解密
-// ----------------------------------------------------------------------------
 export async function encryptBytes(
   key: CryptoKey,
   data: Uint8Array,
@@ -190,25 +235,19 @@ export async function verifyPassword(
 }
 
 // ----------------------------------------------------------------------------
-// AI 分享（百度网盘模式）：用 4 位提取码派生临时密钥加密明文
+// 分享（百度网盘模式）：用 6 位提取码派生临时密钥加密明文
 // ----------------------------------------------------------------------------
-// 流程：用户浏览器用主密钥解密 entry 明文 → 提取码派生临时密钥 → 加密上传
-// AI 拿到 share_id + 提取码后 → 本地派生密钥 → 解密得到明文
-// 服务器始终不接触明文。
 
-/** 生成 4 位数字提取码（0000-9999） */
 export function generateShareCode(): string {
-  return Math.floor(Math.random() * 10000)
+  return Math.floor(Math.random() * 1_000_000)
     .toString()
-    .padStart(4, "0");
+    .padStart(6, "0");
 }
 
-/** 生成 16 字节分享 salt（base64） */
 export function generateShareSalt(): string {
   return bytesToBase64(crypto.getRandomValues(new Uint8Array(SALT_LENGTH)));
 }
 
-/** 提取码 SHA-256 哈希（服务器比对用，与 worker 逻辑一致） */
 export async function hashShareCode(code: string): Promise<string> {
   const buf = await crypto.subtle.digest(
     "SHA-256",
@@ -219,8 +258,7 @@ export async function hashShareCode(code: string): Promise<string> {
     .join("");
 }
 
-/** 用提取码派生 AES-GCM 临时密钥（PBKDF2-SHA256，提取码空间小需高迭代） */
-async function deriveShareKey(
+export async function deriveShareKey(
   code: string,
   saltB64: string,
 ): Promise<CryptoKey> {
@@ -236,7 +274,7 @@ async function deriveShareKey(
     {
       name: "PBKDF2",
       salt: toArrayBuffer(salt),
-      iterations: 100_000,
+      iterations: SHARE_PBKDF2_ITERATIONS,
       hash: "SHA-256",
     },
     keyMaterial,
@@ -247,11 +285,9 @@ async function deriveShareKey(
 }
 
 export interface SharePayload extends EncryptedPayload {
-  /** 提取码 salt（base64），服务器原样返回给 AI */
   salt: string;
 }
 
-/** 用提取码加密明文（用户上传时调用） */
 export async function encryptWithShareCode(
   plaintext: string,
 ): Promise<{ code: string; payload: SharePayload }> {
@@ -275,11 +311,13 @@ export async function encryptWithShareCode(
   };
 }
 
-/** 用提取码解密（AI 端调用） */
 export async function decryptWithShareCode(
   code: string,
   payload: SharePayload,
 ): Promise<string> {
+  if (!/^\d{4,6}$/.test(code)) {
+    throw new Error("提取码格式错误（4-6 位数字）");
+  }
   const key = await deriveShareKey(code, payload.salt);
   const iv = base64ToBytes(payload.iv);
   const ct = base64ToBytes(payload.ciphertext);
@@ -289,4 +327,35 @@ export async function decryptWithShareCode(
     toArrayBuffer(ct),
   );
   return new TextDecoder().decode(plainBuf);
+}
+
+// ----------------------------------------------------------------------------
+// 批量分享：复用同一 share key 多次加密
+// ----------------------------------------------------------------------------
+
+export async function encryptWithShareKey(
+  plaintext: string,
+  key: CryptoKey,
+): Promise<EncryptedPayload> {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const data = new TextEncoder().encode(plaintext);
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(data),
+  );
+  return { ciphertext: bytesToBase64(new Uint8Array(ct)), iv: bytesToBase64(iv) };
+}
+
+export async function encryptBytesWithShareKey(
+  data: Uint8Array,
+  key: CryptoKey,
+): Promise<EncryptedPayload> {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(data),
+  );
+  return { ciphertext: bytesToBase64(new Uint8Array(ct)), iv: bytesToBase64(iv) };
 }
