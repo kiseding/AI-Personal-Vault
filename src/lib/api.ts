@@ -48,6 +48,27 @@ export interface VaultConfig {
   verifier?: { ciphertext: string; iv: string };
 }
 
+export interface AttachmentMeta {
+  id: string;
+  entry_id: string;
+  name: string;
+  mime: string;
+  size: number;
+  r2_key: string;
+  iv: string;
+  created_at: string;
+}
+
+export interface AttachmentDownload {
+  /** 解密后的明文字节 */
+  data: Uint8Array;
+  name: string;
+  mime: string;
+  size: number;
+  /** 加密用的 IV（base64） */
+  iv: string;
+}
+
 export const api = {
   health: () => req<{ ok: boolean; time: string }>("/api/health"),
 
@@ -117,6 +138,35 @@ export const api = {
   restoreVersion: (id: string, vid: string) =>
     req<null>(`/api/entries/${id}/versions/${vid}/restore`, { method: "POST" }),
 
+  // --- 附件 ---
+  listAttachments: (entryId: string) =>
+    req<AttachmentMeta[]>(`/api/entries/${entryId}/attachments`),
+  /**
+   * 下载附件密文（不自动解密；调用方用 master key 解密）
+   * 返回原始 ciphertext 字节 + IV/Name/Mime 等元数据
+   */
+  downloadAttachmentRaw: async (aid: string): Promise<{
+    ciphertext: Uint8Array;
+    iv: string;
+    size: number;
+    name: string;
+    mime: string;
+  }> => {
+    const token = getAppToken();
+    const res = await fetch(`/api/attachments/${aid}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) throw new Error(`附件下载失败 (${res.status})`);
+    const iv = res.headers.get("X-Attachment-IV") ?? "";
+    const size = Number(res.headers.get("X-Attachment-Size") ?? 0);
+    const disposition = res.headers.get("Content-Disposition") ?? "";
+    const nameMatch = disposition.match(/filename="([^"]+)"/);
+    const name = nameMatch ? decodeURIComponent(nameMatch[1]) : "file";
+    const mime = res.headers.get("Content-Type") ?? "application/octet-stream";
+    const ciphertext = new Uint8Array(await res.arrayBuffer());
+    return { ciphertext, iv, size, name, mime };
+  },
+
   // --- AI Access ---
   getGrants: (entryId: string) =>
     req<
@@ -135,26 +185,55 @@ export const api = {
       body: JSON.stringify({ entry_id: entryId, agent, ttl }),
     }),
 
-  // --- AI 分享（百度网盘模式：链接 + 提取码）------------------------------
+  // --- AI 分享（百度网盘模式）---
+  /**
+   * 创建分享（同时支持单条与批量）：
+   *   - 单条：传 entry_id
+   *   - 批量：传 entry_ids（数组）+ 可选 files（附件密文）
+   * 密文 + salt + code_hash 由浏览器侧用 share key 加密后传入。
+   */
   createShare: (body: {
-    entry_id: string;
+    entry_id?: string;
+    entry_ids?: string[];
     ciphertext: string;
     iv: string;
     salt: string;
     code_hash: string;
+    files?: Array<{
+      name: string;
+      mime: string;
+      size: number;
+      ciphertext: string;
+      iv: string;
+    }>;
     ttl?: number;
     max_uses?: number;
-  }) =>
-    req<{ share_id: string; expires_at: string; max_uses: number; ttl: number }>(
-      "/api/ai/share",
-      { method: "POST", body: JSON.stringify(body) },
-    ),
+  }) => {
+    const kind: "single" | "batch" = body.entry_ids ? "batch" : "single";
+    return req<{
+      share_id: string;
+      expires_at: string;
+      max_uses: number;
+      ttl: number;
+      kind: "single" | "batch";
+      item_count: number;
+    }>("/api/ai/share", {
+      method: "POST",
+      body: JSON.stringify({ ...body, kind }),
+    });
+  },
+
   fetchShare: (shareId: string, code: string) =>
     fetch(`/api/ai/share/${shareId}?code=${encodeURIComponent(code)}`).then(
       async (res) => {
         const json = (await res.json()) as ApiResponse<{
-          entry_id: string;
-          entry_title: string | null;
+          entry_id?: string;
+          entry_title?: string | null;
+          kind?: "single" | "batch";
+          item_count?: number;
+          entry_ids?: string[];
+          entry_titles?: string[];
+          file_names?: string[];
           ciphertext: string;
           iv: string;
           salt: string;
@@ -178,6 +257,8 @@ export const api = {
         used_count: number;
         created_at: string;
         is_expired: number;
+        kind: string;
+        item_count: number;
       }>
     >("/api/ai/shares"),
 
