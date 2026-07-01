@@ -1,5 +1,5 @@
 /**
- * Hono 中间件：API 鉴权 + 审计日志 + 统一错误处理
+ * Hono 中间件：API 鉴权 + 审计日志 + 共享 CORS + 安全响应头
  */
 import { createMiddleware } from "hono/factory";
 import type { Context } from "hono";
@@ -62,7 +62,7 @@ export const ipMiddleware = createMiddleware<AppContext>(async (c, next) => {
 });
 
 /**
- * 记录审计日志到 D1（第十五章：所有访问必须记录）。
+ * 审计日志写入（所有可识别的访问都会留下痕迹）
  * 即使业务失败也应尽量记录，因此用 `c.executionCtx.waitUntil` 异步写入。
  */
 export function audit(
@@ -83,3 +83,40 @@ export function audit(
       .run(),
   );
 }
+
+/**
+ * 共享端点 CORS（feat/mobile-hardening）
+ *
+ * /api/ai/share/* 路由用 4-6 位提取码鉴权，不需要 APP_TOKEN。
+ * 跨域浏览器 / 远程 MCP 服务可能从其他 origin 拉取，需要 CORS 头放行 OPTIONS 预检。
+ *
+ * 放行策略：通用 `*`，因为分享数据的最终鉴权是提取码本身，origin 仅是传输层细节。
+ * 如未来需要更严格，可改成读取白名单 env（CORS_ALLOWED_ORIGINS）。
+ */
+const SHARE_CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "X-Share-Code, Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+export const shareCors = createMiddleware<AppContext>(async (c, next) => {
+  if (!c.req.path.startsWith("/api/ai/share/")) {
+    await next();
+    return;
+  }
+  for (const [k, v] of Object.entries(SHARE_CORS_HEADERS)) {
+    c.header(k, v);
+  }
+  if (c.req.method === "OPTIONS") {
+    return c.body(null, 204);
+  }
+  await next();
+});
+
+// ----------------------------------------------------------------------------
+// 安全响应头与限流（详见 ./lib/security-headers.ts 与 ./lib/rate-limit.ts）
+// ----------------------------------------------------------------------------
+export { securityHeaders } from "./lib/security-headers";
+export { rateLimit, DEFAULT_RULES } from "./lib/rate-limit";
+export type { RateLimitRule } from "./lib/rate-limit";
