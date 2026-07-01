@@ -16,7 +16,8 @@ import type { EntryContent } from "@/shared/types";
 // ----------------------------------------------------------------------------
 // 常量
 // ----------------------------------------------------------------------------
-const PBKDF2_ITERATIONS = 600_000; // OWASP 2023 推荐下限
+const PBKDF2_ITERATIONS = 600_000; // OWASP 2023 推荐下限（主密码派生）
+const SHARE_PBKDF2_ITERATIONS = 100_000; // 4 位提取码派生（码空间小，需高迭代防爆破）
 const SALT_LENGTH = 16; // 字节
 const IV_LENGTH = 12; // AES-GCM 推荐 96 位
 const KEY_LENGTH = 256; // 位
@@ -190,9 +191,11 @@ export async function verifyPassword(
 }
 
 // ----------------------------------------------------------------------------
-// AI 分享（百度网盘模式）：用 4 位提取码派生临时密钥加密明文
+// 分享（百度网盘模式）：用 4 位提取码派生临时密钥加密明文
 // ----------------------------------------------------------------------------
-// 流程：用户浏览器用主密钥解密 entry 明文 → 提取码派生临时密钥 → 加密上传
+// 单条分享流程：用户浏览器用主密钥解密 entry 明文 → 提取码派生临时密钥 → 加密上传
+// 批量分享流程：用户浏览器解密 N 个 entry + 可选附件 → bundle JSON → 提取码派生
+//   临时密钥（一次派生，多次 encrypt）→ bundle 整体加密上传
 // AI 拿到 share_id + 提取码后 → 本地派生密钥 → 解密得到明文
 // 服务器始终不接触明文。
 
@@ -220,7 +223,7 @@ export async function hashShareCode(code: string): Promise<string> {
 }
 
 /** 用提取码派生 AES-GCM 临时密钥（PBKDF2-SHA256，提取码空间小需高迭代） */
-async function deriveShareKey(
+export async function deriveShareKey(
   code: string,
   saltB64: string,
 ): Promise<CryptoKey> {
@@ -236,7 +239,7 @@ async function deriveShareKey(
     {
       name: "PBKDF2",
       salt: toArrayBuffer(salt),
-      iterations: 100_000,
+      iterations: SHARE_PBKDF2_ITERATIONS,
       hash: "SHA-256",
     },
     keyMaterial,
@@ -251,7 +254,7 @@ export interface SharePayload extends EncryptedPayload {
   salt: string;
 }
 
-/** 用提取码加密明文（用户上传时调用） */
+/** 用提取码加密明文（用户上传时调用，单条分享场景） */
 export async function encryptWithShareCode(
   plaintext: string,
 ): Promise<{ code: string; payload: SharePayload }> {
@@ -289,4 +292,37 @@ export async function decryptWithShareCode(
     toArrayBuffer(ct),
   );
   return new TextDecoder().decode(plainBuf);
+}
+
+// ----------------------------------------------------------------------------
+// 批量分享（0003 迁移）：一次派生 key，多次加密不同字段
+// ----------------------------------------------------------------------------
+
+/** 用已有 share key 加密字符串（每次随机 IV，可多次调用） */
+export async function encryptWithShareKey(
+  plaintext: string,
+  key: CryptoKey,
+): Promise<EncryptedPayload> {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const data = new TextEncoder().encode(plaintext);
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(data),
+  );
+  return { ciphertext: bytesToBase64(new Uint8Array(ct)), iv: bytesToBase64(iv) };
+}
+
+/** 用已有 share key 加密二进制 */
+export async function encryptBytesWithShareKey(
+  data: Uint8Array,
+  key: CryptoKey,
+): Promise<EncryptedPayload> {
+  const iv = crypto.getRandomValues(new Uint8Array(IV_LENGTH));
+  const ct = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv: toArrayBuffer(iv) },
+    key,
+    toArrayBuffer(data),
+  );
+  return { ciphertext: bytesToBase64(new Uint8Array(ct)), iv: bytesToBase64(iv) };
 }
