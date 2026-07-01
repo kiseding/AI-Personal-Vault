@@ -38,7 +38,7 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
           session.setConfig(c.salt, c.verifier);
         }
       } catch (e) {
-        setError((e as Error).message);
+        setError("无法连接服务器：" + (e as Error).message);
       } finally {
         setLoading(false);
       }
@@ -61,7 +61,13 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
       session.setConfig(salt, verifier);
       onUnlocked();
     } catch (e) {
-      setError((e as Error).message);
+      // setup 阶段错误通常是网络 / APP_TOKEN / 派生失败，细化提示便于排查
+      const msg = (e as Error).message;
+      setError(
+        msg.includes("401") || msg.includes("未授权")
+          ? "APP_TOKEN 无效：请检查 .dev.vars 或 Cloudflare Secret"
+          : "设置失败：" + msg,
+      );
     } finally {
       setBusy(false);
     }
@@ -69,6 +75,11 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
 
   const handleUnlock = async () => {
     setError(null);
+    // 配置未就绪时禁用提交，避免 race 触发空 salt 派生
+    if (loading || !session.salt() || !session.verifier()) {
+      setError("保险库配置加载中…");
+      return;
+    }
     setBusy(true);
     try {
       const key = await verifyPassword(
@@ -83,7 +94,8 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
       session.setKey(key);
       onUnlocked();
     } catch (e) {
-      setError((e as Error).message);
+      // AEAD 解密失败可能是主密码错，也可能是 verifier 数据损坏
+      setError("解锁失败：保险库数据可能损坏，请刷新页面重试");
     } finally {
       setBusy(false);
     }
@@ -121,7 +133,7 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
               autoFocus
               onSubmit={handleUnlock}
             />
-            <Button onClick={handleUnlock} loading={busy}>
+            <Button onClick={handleUnlock} loading={busy || loading}>
               解锁
             </Button>
           </>
@@ -145,7 +157,7 @@ export function Auth({ onUnlocked }: { onUnlocked: () => void }) {
               placeholder="再次输入"
               onSubmit={handleSetup}
             />
-            <Button onClick={handleSetup} loading={busy}>
+            <Button onClick={handleSetup} loading={busy || loading}>
               创建保险库
             </Button>
             <p className="text-xs text-ink-500 leading-relaxed">
