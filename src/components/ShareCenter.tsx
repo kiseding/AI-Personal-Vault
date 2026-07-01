@@ -1,5 +1,6 @@
 /**
  * 分享中心：列出所有 AI 分享（链接 + 提取码），可撤销
+ * 显示批量分享的条目数（kind=batch + item_count）
  */
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api";
@@ -13,6 +14,8 @@ interface ShareInfo {
   used_count: number;
   created_at: string;
   is_expired: number;
+  kind: string;
+  item_count: number;
 }
 
 export function ShareCenter({ onBack }: { onBack: () => void }) {
@@ -116,12 +119,13 @@ export function ShareCenter({ onBack }: { onBack: () => void }) {
             <div className="text-3xl">🔗</div>
             <p>暂无分享</p>
             <p className="text-xs">
-              在条目详情页点 🔗 按钮可生成分享链接
+              在条目详情页点 🔗 按钮，或在侧栏点 📦 多选分享
             </p>
           </div>
         )}
         {filtered.map((s) => {
           const expired = !!s.is_expired || s.used_count >= s.max_uses;
+          const isBatch = s.kind === "batch";
           return (
             <div
               key={s.id}
@@ -131,8 +135,13 @@ export function ShareCenter({ onBack }: { onBack: () => void }) {
             >
               <div className="flex items-start justify-between gap-2">
                 <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium truncate">
-                    {s.entry_title ?? "(已删除条目)"}
+                  <div className="text-sm font-medium truncate flex items-center gap-1.5">
+                    <span>{s.entry_title ?? "(已删除条目)"}</span>
+                    {isBatch && (
+                      <span className="text-[10px] bg-accent/15 text-accent px-1.5 py-0.5 rounded shrink-0">
+                        批量 · {s.item_count} 条
+                      </span>
+                    )}
                   </div>
                   <div className="text-[11px] text-ink-500 mt-0.5 font-mono truncate">
                     {s.id.slice(0, 16)}…
