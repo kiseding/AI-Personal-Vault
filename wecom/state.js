@@ -1,0 +1,134 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { getWebhookBotSendUrl } from "./constants.js";
+import { resolveAgentConfigForAccount, resolveDefaultAccountId, resolveAccount } from "./accounts.js";
+
+const runtimeState = {
+  runtime: null,
+  openclawConfig: null,
+  channelRuntime: null,
+  ensuredDynamicAgentIds: new Set(),
+  ensureDynamicAgentWriteQueue: Promise.resolve(),
+  sessionChatInfo: new Map(),
+};
+
+const SESSION_CHAT_INFO_MAX_SIZE = 5000;
+
+export const dispatchLocks = new Map();
+export const streamContext = new AsyncLocalStorage();
+
+export function setRuntime(runtime) {
+  runtimeState.runtime = runtime;
+}
+
+export function getRuntime() {
+  if (!runtimeState.runtime) {
+    throw new Error("[wecom] Runtime not initialized");
+  }
+  return runtimeState.runtime;
+}
+
+export function setChannelRuntime(channelRuntime) {
+  runtimeState.channelRuntime = channelRuntime;
+}
+
+export function getChannelRuntime() {
+  return runtimeState.channelRuntime;
+}
+
+export function setOpenclawConfig(config) {
+  runtimeState.openclawConfig = config;
+}
+
+export function getOpenclawConfig() {
+  return runtimeState.openclawConfig;
+}
+
+export function getEnsuredDynamicAgentIds() {
+  return runtimeState.ensuredDynamicAgentIds;
+}
+
+export function getEnsureDynamicAgentWriteQueue() {
+  return runtimeState.ensureDynamicAgentWriteQueue;
+}
+
+export function setEnsureDynamicAgentWriteQueue(queuePromise) {
+  runtimeState.ensureDynamicAgentWriteQueue = queuePromise;
+}
+
+function normalizeSessionKey(sessionKey) {
+  return String(sessionKey ?? "").trim();
+}
+
+export function setSessionChatInfo(sessionKey, info) {
+  const key = normalizeSessionKey(sessionKey);
+  if (!key) {
+    return;
+  }
+  if (runtimeState.sessionChatInfo.size >= SESSION_CHAT_INFO_MAX_SIZE && !runtimeState.sessionChatInfo.has(key)) {
+    const oldestKey = runtimeState.sessionChatInfo.keys().next().value;
+    if (oldestKey !== undefined) {
+      runtimeState.sessionChatInfo.delete(oldestKey);
+    }
+  }
+  runtimeState.sessionChatInfo.set(key, {
+    chatId: String(info?.chatId ?? "").trim(),
+    chatType: info?.chatType === "group" ? "group" : info?.chatType === "single" ? "single" : undefined,
+  });
+}
+
+export function getSessionChatInfo(sessionKey) {
+  const key = normalizeSessionKey(sessionKey);
+  if (!key) {
+    return undefined;
+  }
+  return runtimeState.sessionChatInfo.get(key);
+}
+
+export function deleteSessionChatInfo(sessionKey) {
+  const key = normalizeSessionKey(sessionKey);
+  if (!key) {
+    return;
+  }
+  runtimeState.sessionChatInfo.delete(key);
+}
+
+function resolveEffectiveAccountId(accountId) {
+  if (accountId) {
+    return accountId;
+  }
+  const contextual = streamContext.getStore()?.accountId;
+  if (contextual) {
+    return contextual;
+  }
+  return resolveDefaultAccountId(getOpenclawConfig());
+}
+
+export function resolveAgentConfig(accountId) {
+  return resolveAgentConfigForAccount(getOpenclawConfig(), resolveEffectiveAccountId(accountId));
+}
+
+export function resolveAccountConfig(accountId) {
+  return resolveAccount(getOpenclawConfig(), resolveEffectiveAccountId(accountId));
+}
+
+export function resolveWebhookUrl(name, accountId) {
+  const account = resolveAccountConfig(accountId);
+  const value = account?.config?.webhooks?.[name];
+  if (!value) {
+    return null;
+  }
+  if (String(value).startsWith("http")) {
+    return String(value);
+  }
+  return `${getWebhookBotSendUrl()}?key=${value}`;
+}
+
+export function resetStateForTesting() {
+  runtimeState.runtime = null;
+  runtimeState.openclawConfig = null;
+  runtimeState.channelRuntime = null;
+  runtimeState.ensuredDynamicAgentIds = new Set();
+  runtimeState.ensureDynamicAgentWriteQueue = Promise.resolve();
+  runtimeState.sessionChatInfo = new Map();
+  dispatchLocks.clear();
+}

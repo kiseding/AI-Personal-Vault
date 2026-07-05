@@ -1,0 +1,2834 @@
+import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, URL } from "node:url";
+import { WSClient, generateReqId } from "@wecom/aibot-node-sdk";
+import { uploadAndReplyMedia, buildMediaErrorSummary } from "./media-uploader.js";
+import { createPersistentReqIdStore } from "./reqid-store.js";
+import { agentSendMedia, agentSendText, agentUploadMedia } from "./agent-api.js";
+import { applyOutboundSenderProtocol, resolveOutboundSenderLabel } from "./outbound-sender-protocol.js";
+import { buildCfgForDispatch } from "./cfg-for-dispatch.js";
+import { logger } from "../logger.js";
+import { normalizeThinkingTags } from "../think-parser.js";
+import { MessageDeduplicator } from "../utils.js";
+import {
+  extractGroupMessageContent,
+  generateAgentId,
+  getDynamicAgentConfig,
+  shouldTriggerGroupResponse,
+  shouldUseDynamicAgent,
+} from "../dynamic-agent.js";
+import { resolveWecomCommandAuthorized } from "./allow-from.js";
+import { checkCommandAllowlist, getCommandConfig, isWecomAdmin } from "./commands.js";
+import {
+  CHANNEL_ID,
+  DEFAULT_MEDIA_MAX_MB,
+  DEFAULT_WELCOME_MESSAGE,
+  DEFAULT_WELCOME_MESSAGES,
+  FILE_DOWNLOAD_TIMEOUT_MS,
+  IMAGE_DOWNLOAD_TIMEOUT_MS,
+  MEDIA_DOCUMENT_PLACEHOLDER,
+  MEDIA_IMAGE_PLACEHOLDER,
+  MESSAGE_PROCESS_TIMEOUT_MS,
+  REPLY_SEND_TIMEOUT_MS,
+  STREAM_MAX_LIFETIME_MS,
+  THINKING_MESSAGE,
+  WS_HEARTBEAT_INTERVAL_MS,
+  WS_MAX_RECONNECT_ATTEMPTS,
+  setApiBaseUrl,
+} from "./constants.js";
+import { setConfigProxyUrl } from "./http.js";
+import { checkDmPolicy } from "./dm-policy.js";
+import { checkGroupPolicy } from "./group-policy.js";
+import {
+  clearAccountDisplaced,
+  forecastActiveSendQuota,
+  forecastReplyQuota,
+  markAccountDisplaced,
+  recordActiveSend,
+  recordInboundMessage,
+  recordOutboundActivity,
+  recordPassiveReply,
+} from "./runtime-telemetry.js";
+import { dispatchLocks, getRuntime, setOpenclawConfig, setSessionChatInfo, streamContext } from "./state.js";
+import {
+  cleanupWsAccount,
+  deleteMessageState,
+  drainPendingReplies,
+  enqueuePendingReply,
+  getWsClient,
+  hasPendingReplies,
+  setMessageState,
+  setWsClient,
+  startMessageStateCleanup,
+} from "./ws-state.js";
+import { ensureDynamicAgentListed } from "./workspace-template.js";
+import { listAccountIds, resolveAccount } from "./accounts.js";
+import { loadWelcomeMessagesFromFile } from "./welcome-messages-file.js";
+
+const DEFAULT_AGENT_ID = "main";
+const DEFAULT_STATE_DIRNAME = ".openclaw";
+const LEGACY_STATE_DIRNAMES = [".clawdbot", ".moldbot", ".moltbot"];
+const WAITING_MODEL_TICK_MS = 1_000;
+const REASONING_STREAM_THROTTLE_MS = 800;
+const VISIBLE_STREAM_THROTTLE_MS = 800;
+// Reserve headroom below the SDK's per-reqId queue limit (100) so the final
+// reply always has room.
+const MAX_INTERMEDIATE_STREAM_MESSAGES = 85;
+// WeCom stream messages have a hard 6-minute absolute lifetime from creation.
+// Keepalive updates every 4 minutes maintain visible progress but do NOT extend
+// the lifetime.  Stream rotation (see rotateStream) is the actual fix.
+const STREAM_KEEPALIVE_INTERVAL_MS = 4 * 60 * 1000;
+// Match MEDIA:/FILE: directives at line start, optionally preceded by markdown list markers.
+const REPLY_MEDIA_DIRECTIVE_PATTERN = /^\s*(?:[-*•]\s+|\d+\.\s+)?(?:MEDIA|FILE)\s*:/im;
+const WECOM_REPLY_MEDIA_GUIDANCE_HEADER = "[WeCom reply media rule]";
+const inboundMessageDeduplicator = new MessageDeduplicator();
+const sessionReasoningInitLocks = new Map();
+const pendingInboundMessages = new Map();
+const INBOUND_DEBOUNCE_MS = 5000;
+
+function withTimeout(promise, timeoutMs, message) {
+  if (!timeoutMs || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return promise;
+  }
+
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message ?? `Timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  // Suppress unhandled rejection from the original promise if the timeout wins
+  // the race. Without this, a later rejection from the underlying SDK call
+  // becomes an unhandled promise rejection.
+  promise.catch(() => {});
+
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  });
+}
+
+function normalizeReasoningStreamText(text) {
+  const source = String(text ?? "").trim();
+  if (!source) {
+    return "";
+  }
+
+  const withoutPrefix = source.replace(/^Reasoning:\s*/i, "").trim();
+  if (!withoutPrefix) {
+    return "";
+  }
+
+  const lines = withoutPrefix
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const match = line.match(/^([_*~`])(.*)\1$/);
+      return match ? match[2].trim() : line;
+    })
+    .filter(Boolean);
+
+  return lines.join("\n").trim();
+}
+
+function buildWaitingModelContent(seconds) {
+  const normalizedSeconds = Math.max(1, Number.parseInt(String(seconds ?? 1), 10) || 1);
+  return `<think>等待模型响应 ${normalizedSeconds}s`;
+}
+
+function buildWaitingModelReasoningText(seconds) {
+  const normalizedSeconds = Math.max(1, Number.parseInt(String(seconds ?? 1), 10) || 1);
+  return `等待模型响应 ${normalizedSeconds}s`;
+}
+
+function buildWsStreamContent({ reasoningText = "", visibleText = "", finish = false }) {
+  const normalizedReasoning = String(reasoningText ?? "").trim();
+  const normalizedVisible = String(visibleText ?? "").trim();
+
+  if (!normalizedReasoning) {
+    return normalizedVisible;
+  }
+
+  const shouldCloseThink = finish || Boolean(normalizedVisible);
+  const thinkBlock = shouldCloseThink
+    ? `<think>${normalizedReasoning}</think>`
+    : `<think>${normalizedReasoning}`;
+
+  return normalizedVisible ? `${thinkBlock}\n${normalizedVisible}` : thinkBlock;
+}
+
+function normalizeWecomCreateTimeMs(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0;
+  }
+  return Math.trunc(seconds * 1000);
+}
+
+function getWecomSourceTiming(createTime, now = Date.now()) {
+  const sourceCreateTimeMs = normalizeWecomCreateTimeMs(createTime);
+  if (!sourceCreateTimeMs) {
+    return {
+      sourceCreateTime: undefined,
+      sourceCreateTimeIso: undefined,
+      sourceToIngressMs: undefined,
+    };
+  }
+
+  return {
+    sourceCreateTime: createTime,
+    sourceCreateTimeIso: new Date(sourceCreateTimeMs).toISOString(),
+    sourceToIngressMs: Math.max(0, now - sourceCreateTimeMs),
+  };
+}
+
+function resolveWsKeepaliveContent({ reasoningText = "", visibleText = "", lastStreamText = "" }) {
+  const currentContent = buildWsStreamContent({
+    reasoningText,
+    visibleText,
+    finish: false,
+  });
+  return currentContent || String(lastStreamText ?? "").trim() || THINKING_MESSAGE;
+}
+
+function normalizeSessionStoreKey(sessionKey) {
+  return String(sessionKey ?? "").trim().toLowerCase();
+}
+
+async function withSessionReasoningInitLock(storePath, task) {
+  const lockKey = path.resolve(String(storePath ?? ""));
+  const previous = sessionReasoningInitLocks.get(lockKey) ?? Promise.resolve();
+  const current = previous.then(task, task);
+  sessionReasoningInitLocks.set(lockKey, current);
+  return await current.finally(() => {
+    if (sessionReasoningInitLocks.get(lockKey) === current) {
+      sessionReasoningInitLocks.delete(lockKey);
+    }
+  });
+}
+
+async function ensureDefaultSessionReasoningLevel({
+  core,
+  storePath,
+  sessionKey,
+  ctx,
+  reasoningLevel = "stream",
+  channelTag = "WS",
+}) {
+  const normalizedSessionKey = normalizeSessionStoreKey(sessionKey);
+  if (!storePath || !normalizedSessionKey || !ctx || !core?.session?.recordSessionMetaFromInbound) {
+    return null;
+  }
+
+  try {
+    const recorded = await core.session.recordSessionMetaFromInbound({
+      storePath,
+      sessionKey: normalizedSessionKey,
+      ctx,
+    });
+    if (!recorded || recorded.reasoningLevel != null) {
+      return recorded;
+    }
+
+    return await withSessionReasoningInitLock(storePath, async () => {
+      let store;
+      try {
+        store = JSON.parse(await readFile(storePath, "utf8"));
+      } catch (error) {
+        logger.warn(`[${channelTag}] Failed to read session store for reasoning default: ${error.message}`);
+        return recorded;
+      }
+
+      const resolvedKey = Object.keys(store).find((key) => normalizeSessionStoreKey(key) === normalizedSessionKey);
+      if (!resolvedKey) {
+        return recorded;
+      }
+
+      const existing = store[resolvedKey];
+      if (!existing || typeof existing !== "object" || existing.reasoningLevel != null) {
+        return existing ?? recorded;
+      }
+
+      store[resolvedKey] = { ...existing, reasoningLevel };
+      await writeFile(storePath, `${JSON.stringify(store, null, 2)}\n`);
+      logger.info(`[${channelTag}] Initialized session reasoningLevel default`, {
+        sessionKey: resolvedKey,
+        reasoningLevel,
+      });
+      return store[resolvedKey];
+    });
+  } catch (error) {
+    logger.warn(`[${channelTag}] Failed to initialize session reasoning default: ${error.message}`);
+    return null;
+  }
+}
+
+function createSdkLogger(accountId) {
+  return {
+    debug: (message, ...args) => logger.debug(`[WS:${accountId}] ${message}`, ...args),
+    info: (message, ...args) => logger.info(`[WS:${accountId}] ${message}`, ...args),
+    warn: (message, ...args) => logger.warn(`[WS:${accountId}] ${message}`, ...args),
+    error: (message, ...args) => logger.error(`[WS:${accountId}] ${message}`, ...args),
+  };
+}
+
+function getRegisteredRuntimeOrNull() {
+  try {
+    return getRuntime();
+  } catch {
+    return null;
+  }
+}
+
+function resolveChannelCore(runtime) {
+  const registeredRuntime = getRegisteredRuntimeOrNull();
+  const candidates = [runtime?.channel, runtime, registeredRuntime?.channel, registeredRuntime];
+
+  for (const candidate of candidates) {
+    if (candidate?.routing && candidate?.reply && candidate?.session) {
+      return candidate;
+    }
+  }
+
+  throw new Error("OpenClaw channel runtime is unavailable");
+}
+
+function resolveUserPath(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  if (trimmed.startsWith("~")) {
+    const homeDir = process.env.OPENCLAW_HOME?.trim() || process.env.HOME || os.homedir();
+    return path.resolve(homeDir, trimmed.slice(1).replace(/^\/+/, ""));
+  }
+  return path.resolve(trimmed);
+}
+
+function resolveStateDir() {
+  const override = process.env.OPENCLAW_STATE_DIR?.trim();
+  if (override) {
+    return resolveUserPath(override);
+  }
+
+  const homeDir = process.env.OPENCLAW_HOME?.trim() || process.env.HOME || os.homedir();
+  const preferred = path.join(homeDir, DEFAULT_STATE_DIRNAME);
+  if (existsSync(preferred)) {
+    return preferred;
+  }
+
+  for (const legacyName of LEGACY_STATE_DIRNAMES) {
+    const candidate = path.join(homeDir, legacyName);
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return preferred;
+}
+
+function normalizeAgentId(agentId) {
+  return String(agentId ?? "")
+    .trim()
+    .toLowerCase() || DEFAULT_AGENT_ID;
+}
+
+function resolveDefaultAgentId(config) {
+  const list = Array.isArray(config?.agents?.list) ? config.agents.list.filter(Boolean) : [];
+  if (list.length === 0) {
+    return DEFAULT_AGENT_ID;
+  }
+
+  const defaults = list.filter((entry) => entry?.default);
+  return normalizeAgentId(defaults[0]?.id ?? list[0]?.id ?? DEFAULT_AGENT_ID);
+}
+
+function resolveAgentWorkspaceDir(config, agentId) {
+  const normalizedAgentId = normalizeAgentId(agentId);
+  const list = Array.isArray(config?.agents?.list) ? config.agents.list.filter(Boolean) : [];
+  const agentEntry = list.find((entry) => normalizeAgentId(entry?.id) === normalizedAgentId);
+  const configuredWorkspace = String(agentEntry?.workspace ?? "").trim();
+
+  if (configuredWorkspace) {
+    return resolveUserPath(configuredWorkspace);
+  }
+
+  const stateDir = resolveStateDir();
+  const defaultWorkspace = String(config?.agents?.defaults?.workspace ?? "").trim();
+  if (normalizedAgentId === resolveDefaultAgentId(config)) {
+    return defaultWorkspace ? resolveUserPath(defaultWorkspace) : path.join(stateDir, "workspace");
+  }
+
+  if (defaultWorkspace) {
+    return path.join(resolveUserPath(defaultWorkspace), normalizedAgentId);
+  }
+
+  return path.join(stateDir, `workspace-${normalizedAgentId}`);
+}
+
+function resolveConfiguredReplyMediaLocalRoots(config) {
+  const topLevel = Array.isArray(config?.channels?.[CHANNEL_ID]?.mediaLocalRoots)
+    ? config.channels[CHANNEL_ID].mediaLocalRoots
+    : [];
+
+  // Also collect mediaLocalRoots from each account entry (multi-account mode).
+  // In single-account mode the account config IS the top-level config, so
+  // listAccountIds returns ["default"] and the roots are already in topLevel.
+  const accountRoots = [];
+  for (const accountId of listAccountIds(config)) {
+    const accountConfig = resolveAccount(config, accountId)?.config;
+    if (Array.isArray(accountConfig?.mediaLocalRoots)) {
+      accountRoots.push(...accountConfig.mediaLocalRoots);
+    }
+  }
+
+  const merged = [...new Set([...topLevel, ...accountRoots])];
+  return merged.map((entry) => resolveUserPath(entry)).filter(Boolean);
+}
+
+function resolveReplyMediaLocalRoots(config, agentId) {
+  const workspaceDir = resolveAgentWorkspaceDir(config, agentId || resolveDefaultAgentId(config));
+  const browserMediaDir = path.join(resolveStateDir(), "media", "browser");
+  const configuredRoots = resolveConfiguredReplyMediaLocalRoots(config);
+  return [...new Set([workspaceDir, browserMediaDir, ...configuredRoots].map((entry) => path.resolve(entry)))];
+}
+
+function mergeReplyMediaUrls(...lists) {
+  const seen = new Set();
+  const merged = [];
+
+  for (const list of lists) {
+    if (!Array.isArray(list)) {
+      continue;
+    }
+    for (const entry of list) {
+      const normalized = typeof entry === "string" ? entry.trim() : "";
+      if (!normalized || seen.has(normalized)) {
+        continue;
+      }
+      seen.add(normalized);
+      merged.push(normalized);
+    }
+  }
+
+  return merged;
+}
+
+function buildReplyMediaGuidance(config, agentId) {
+  const workspaceDir = resolveAgentWorkspaceDir(config, agentId || resolveDefaultAgentId(config));
+  const browserMediaDir = path.join(resolveStateDir(), "media", "browser");
+  const configuredRoots = resolveConfiguredReplyMediaLocalRoots(config);
+  const qwenImageToolsConfig = config?.plugins?.entries?.wecom?.config?.qwenImageTools;
+  const guidance = [
+    WECOM_REPLY_MEDIA_GUIDANCE_HEADER,
+    `Local reply files are allowed only under the current workspace: ${workspaceDir}`,
+    "Inside the agent sandbox, that same workspace is visible as /workspace.",
+    `Browser-generated files are also allowed only under: ${browserMediaDir}`,
+    "CRITICAL: Do NOT echo raw browser host paths from browser tools directly in the final reply.",
+    "If a browser tool returns MEDIA:/... or FILE:/... under that browser media directory, call stage_browser_media first.",
+    "stage_browser_media copies the browser file into the current workspace and returns a safe /workspace/... directive for the final reply.",
+    "Do NOT use the message tool with action=\"send\" or action=\"sendAttachment\" to deliver files back to the current WeCom chat/user; use MEDIA: or FILE: directives instead.",
+    "CRITICAL: MEDIA: and FILE: directives MUST be placed INSIDE <final> tags. Directives placed outside <final> are silently discarded by the system and the file will never be sent.",
+    "For images: put each image path on its own line INSIDE <final> tags as MEDIA:/abs/path.",
+    "If a local file is in the current sandbox workspace, use its /workspace/... path directly.",
+    "For every non-image file (PDF, MD, DOC, DOCX, XLS, XLSX, CSV, ZIP, MP4, TXT, etc.): put it on its own line INSIDE <final> tags as FILE:/abs/path.",
+    "Example: <final>报告已生成，请查收。\\nFILE:/workspace/report.xlsx\\n</final> — or for a skill file: <final>\\nFILE:/workspace/skills/deep-research/SKILL.md\\n</final>",
+    "CRITICAL: Never use MEDIA: for non-image files. PDF must always use FILE:, never MEDIA:.",
+    "CRITICAL: If a tool already returned a path prefixed with FILE: (e.g. FILE:/abs/path.pdf), keep the FILE: prefix exactly as-is. Do NOT change it to MEDIA:.",
+    "For public HTTPS images that should appear inline in the answer, keep them as markdown images like ![图片说明](https://example.com/image.png). Do NOT downgrade them to plain URLs.",
+    "Each directive MUST be on its own line with no other text on that line.",
+    "The plugin will automatically send the media to the user.",
+    "[WeCom message-tool rule]",
+    "The OpenClaw `message` tool is disabled on this channel. Do NOT call `message` with action=\"send\" / \"sendAttachment\" — reply with visible text directly inside <final> tags.",
+    "Cross-chat outbound (sending to a different WeCom user/group) is temporarily unavailable. If asked, tell the user the cross-chat path is offline.",
+  ];
+
+  if (configuredRoots.length > 0) {
+    guidance.push(`Additional configured host roots are also allowed: ${configuredRoots.join(", ")}`);
+  }
+
+  if (qwenImageToolsConfig?.enabled === true) {
+    guidance.push(
+      "[WeCom image_studio rule]",
+      "When the user asks to generate an image, use image_studio with action=\"generate\".",
+      "When the user asks to edit an existing image, use image_studio with action=\"edit\" and pass images.",
+      "Use aspect=\"landscape\" for architecture diagrams, flowcharts, and banners unless the user asks otherwise.",
+      "Prefer model_preference=\"qwen\" for text-heavy diagrams or label-rich images, and model_preference=\"wan\" for photorealistic scenes.",
+      "For workspace-local images, always use /workspace/... paths when calling image_studio.",
+      "Prefer n=1 unless the user explicitly asks for multiple images.",
+      "If image_studio returns MEDIA: URLs, treat the image task as completed successfully.",
+      "If image_studio returns MEDIA: URLs, do NOT repeat those URLs in the visible reply.",
+      "Do NOT embed markdown images, raw image URLs, or OSS links in the text reply after image_studio succeeds.",
+      "Instead, tell the user the image will be sent separately, for example: 图片会单独发送，请查收。",
+    );
+  }
+
+  guidance.push("Never reference any other host path.");
+
+  guidance.push(
+    "[WeCom visible text rule]",
+    "ALL text you want the user to see MUST be wrapped in <final> tags — this includes short status messages before tool calls (e.g. <final>正在查询，稍等～</final>).",
+    "Text outside <final> tags is silently discarded and never delivered to the WeCom chat.",
+  );
+
+  return guidance.join("\n");
+}
+
+function normalizeReplyMediaUrlForLoad(mediaUrl, config, agentId) {
+  let normalized = String(mediaUrl ?? "").trim();
+  if (!normalized) {
+    return "";
+  }
+
+  if (/^file:\/\//i.test(normalized)) {
+    try {
+      const parsed = new URL(normalized);
+      if (parsed.protocol === "file:") {
+        normalized = fileURLToPath(parsed);
+      }
+    } catch {
+      return normalized;
+    }
+  }
+
+  if (/^sandbox:\/{0,2}/i.test(normalized)) {
+    normalized = normalized.replace(/^sandbox:\/{0,2}/i, "/");
+  }
+
+  if (normalized === "/workspace" || normalized.startsWith("/workspace/")) {
+    const workspaceDir = resolveAgentWorkspaceDir(config, agentId || resolveDefaultAgentId(config));
+    const rel = normalized === "/workspace" ? "" : normalized.slice("/workspace/".length);
+    const resolved = rel
+      ? path.resolve(workspaceDir, ...rel.split("/").filter(Boolean))
+      : path.resolve(workspaceDir);
+    // Prevent path traversal outside workspace directory
+    const normalizedWorkspace = path.resolve(workspaceDir) + path.sep;
+    if (resolved !== path.resolve(workspaceDir) && !resolved.startsWith(normalizedWorkspace)) {
+      logger.warn(`[WS] Blocked path traversal attempt: ${mediaUrl} resolved to ${resolved}`);
+      return "";
+    }
+    return resolved;
+  }
+
+  return normalized;
+}
+
+function buildBodyForAgent(body, config, agentId) {
+  if (typeof body !== "string" || body.length === 0) {
+    return "";
+  }
+
+  const inlineRules = [
+    "[WeCom agent rules]",
+    "The OpenClaw `message` tool is disabled on this channel. Do NOT call `message` with action=\"send\" / \"sendAttachment\" — reply with visible text directly.",
+    "Cross-chat outbound (sending to a different WeCom user/group via the message tool) is temporarily unavailable.",
+    "To send files back to the current WeCom chat, emit MEDIA:/... or FILE:/... directives on their own lines INSIDE <final> tags.",
+  ].join("\n");
+
+  return `${inlineRules}\n\n${body}`;
+}
+
+function shouldUseMarkdownForActiveSend(content) {
+  const text = String(content ?? "").trim();
+  if (!text) {
+    return true;
+  }
+
+  return true;
+}
+
+function hasRemoteMarkdownImage(content) {
+  return /!\[[^\]]*]\(\s*https?:\/\/[^)\s]+(?:\s+["'][^"']*["'])?\s*\)/i.test(String(content ?? ""));
+}
+
+function extractRemoteMarkdownImageUrls(content) {
+  const text = String(content ?? "");
+  const urls = [];
+  const pattern = /!\[[^\]]*]\(\s*(https?:\/\/[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/gi;
+  let match;
+  while ((match = pattern.exec(text))) {
+    const url = String(match[1] ?? "").trim();
+    if (url) {
+      urls.push(url);
+    }
+  }
+  return urls;
+}
+
+function normalizeVisibleRemoteUrl(url) {
+  const text = String(url ?? "").trim();
+  if (!/^https?:\/\//i.test(text)) {
+    return "";
+  }
+  try {
+    const parsed = new URL(text);
+    return parsed.href;
+  } catch {
+    return text;
+  }
+}
+
+function extractVisibleRemoteUrls(content) {
+  const text = String(content ?? "");
+  const urls = new Set();
+  const markdownUrlPattern = /!?\[[^\]]*]\(\s*(https?:\/\/[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/gi;
+  const rawUrlPattern = /https?:\/\/[^\s<>)`"']+/gi;
+  let match;
+
+  while ((match = markdownUrlPattern.exec(text))) {
+    const normalized = normalizeVisibleRemoteUrl(match[1]);
+    if (normalized) {
+      urls.add(normalized);
+    }
+  }
+
+  while ((match = rawUrlPattern.exec(text))) {
+    const normalized = normalizeVisibleRemoteUrl(String(match[0] ?? "").replace(/[。．.，,；;]+$/g, ""));
+    if (normalized) {
+      urls.add(normalized);
+    }
+  }
+
+  return urls;
+}
+
+function stripAttachedMarkdownImages(content, attachedUrls) {
+  const text = String(content ?? "");
+  const urls = new Set(
+    (attachedUrls ?? [])
+      .map((url) => normalizeVisibleRemoteUrl(url))
+      .filter(Boolean),
+  );
+  if (!text || urls.size === 0) {
+    return text;
+  }
+
+  const markdownImagePattern = /!\[[^\]]*]\(\s*(https?:\/\/[^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/gi;
+  const stripped = text
+    .split("\n")
+    .map((line) => line.replace(markdownImagePattern, (full, url) => {
+      const normalizedUrl = normalizeVisibleRemoteUrl(url);
+      return normalizedUrl && urls.has(normalizedUrl) ? "" : full;
+    }).trimEnd())
+    .filter((line, index, lines) => {
+      if (line.trim()) {
+        return true;
+      }
+      const prevBlank = index > 0 && !String(lines[index - 1] ?? "").trim();
+      return !prevBlank;
+    })
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return stripped;
+}
+
+function isRemoteHttpUrl(value) {
+  return /^https?:\/\//i.test(String(value ?? "").trim());
+}
+
+function isRemoteImageUrl(value) {
+  const text = String(value ?? "").trim();
+  if (!/^https?:\/\//i.test(text)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(text);
+    return /\.(?:apng|avif|gif|jpe?g|png|webp)(?:$|[?#])/i.test(parsed.pathname);
+  } catch {
+    return /\.(?:apng|avif|gif|jpe?g|png|webp)(?:$|[?#])/i.test(text);
+  }
+}
+
+function collectInlineRemoteImageUrls(content, mediaUrls = []) {
+  const urls = [];
+  const seen = new Set();
+
+  const add = (url, { requireImageExtension = true } = {}) => {
+    const normalized = normalizeVisibleRemoteUrl(url);
+    if (!normalized || seen.has(normalized)) {
+      return;
+    }
+    if (requireImageExtension && !isRemoteImageUrl(normalized)) {
+      return;
+    }
+    seen.add(normalized);
+    urls.push(normalized);
+  };
+
+  for (const url of extractRemoteMarkdownImageUrls(content)) {
+    add(url, { requireImageExtension: false });
+  }
+  for (const url of mediaUrls) {
+    add(url);
+  }
+
+  return urls;
+}
+
+function buildPassiveMarkdownReplyText(content, mediaUrls = []) {
+  let text = String(content ?? "").trim();
+  const visibleUrls = extractVisibleRemoteUrls(text);
+  const missingImageLines = [];
+
+  for (const url of collectInlineRemoteImageUrls(text, mediaUrls)) {
+    if (visibleUrls.has(url)) {
+      continue;
+    }
+    visibleUrls.add(url);
+    missingImageLines.push(`![图片](${url})`);
+  }
+
+  if (missingImageLines.length === 0) {
+    return text;
+  }
+
+  return [text, ...missingImageLines]
+    .filter((part) => String(part ?? "").trim())
+    .join("\n\n");
+}
+
+function shouldUsePassiveMarkdownReply(content, mediaUrls = []) {
+  return collectInlineRemoteImageUrls(content, mediaUrls).length > 0;
+}
+
+function isInlineRemoteReplyImage(mediaUrl) {
+  return isRemoteImageUrl(normalizeVisibleRemoteUrl(mediaUrl));
+}
+
+function escapeMarkdownAltText(value) {
+  return String(value ?? "图片")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[[\]\\]/g, "")
+    .trim()
+    .slice(0, 80) || "图片";
+}
+
+function inferPlainImageAltText(previousLine) {
+  const cleaned = String(previousLine ?? "")
+    .trim()
+    .replace(/[:：]\s*$/, "")
+    .replace(/^(?:[-*•]\s+|\d+\.\s+)?/, "")
+    .trim();
+  if (!cleaned || /^图片(?:参考|如下)?$/i.test(cleaned)) {
+    return "图片";
+  }
+  if (/图片|图示|截图|界面|参考/i.test(cleaned)) {
+    return cleaned;
+  }
+  return "图片";
+}
+
+function extractStandaloneRemoteImageUrl(line) {
+  const match = String(line ?? "").match(/^\s*(?:[-*•]\s+|\d+\.\s+)?[`<]?((?:https?:\/\/)[^\s`>)]+)[`>]?[\s。．.，,；;]*$/i);
+  if (!match) {
+    return "";
+  }
+  const url = String(match[1] ?? "").trim();
+  return isRemoteImageUrl(url) ? url : "";
+}
+
+function normalizePlainRemoteImageUrlsInReply(text) {
+  const source = typeof text === "string" ? text : "";
+  if (!source || !/https?:\/\//i.test(source)) {
+    return source;
+  }
+
+  const lines = source.split("\n");
+  const normalized = [];
+  let changed = false;
+
+  for (const line of lines) {
+    const url = extractStandaloneRemoteImageUrl(line);
+    if (!url) {
+      normalized.push(line);
+      continue;
+    }
+
+    const previousLine = normalized.length > 0 ? normalized[normalized.length - 1] : "";
+    const altText = escapeMarkdownAltText(inferPlainImageAltText(previousLine));
+    normalized.push(`![${altText}](${url})`);
+    changed = true;
+  }
+
+  return changed ? normalized.join("\n") : source;
+}
+
+function buildWsActiveSendBody(content, { forceFormat } = {}) {
+  const text = String(content ?? "");
+  if (forceFormat === "markdown_v2" || (!forceFormat && hasRemoteMarkdownImage(text))) {
+    return {
+      msgtype: "markdown_v2",
+      markdown_v2: { content: text },
+    };
+  }
+  return {
+    msgtype: "markdown",
+    markdown: { content: text },
+  };
+}
+
+function splitReplyMediaFromText(text) {
+  if (typeof text !== "string" || !REPLY_MEDIA_DIRECTIVE_PATTERN.test(text)) {
+    return {
+      text: typeof text === "string" ? text : "",
+      mediaUrls: [],
+    };
+  }
+
+  const mediaUrls = [];
+  const keptLines = [];
+
+  for (const line of text.split("\n")) {
+    const trimmed = line.trimStart();
+    if (!REPLY_MEDIA_DIRECTIVE_PATTERN.test(trimmed)) {
+      keptLines.push(line);
+      continue;
+    }
+
+    // Strip optional markdown list prefix ("- ", "* ", "1. ") then the directive.
+    const mediaUrl = trimmed
+      .replace(/^(?:[-*•]\s+|\d+\.\s+)?/, "")
+      .replace(/^(MEDIA|FILE)\s*:\s*/i, "")
+      .trim()
+      .replace(/^`(.+)`$/, "$1");
+    if (mediaUrl) {
+      mediaUrls.push(mediaUrl);
+    }
+  }
+
+  return {
+    text: keptLines.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    mediaUrls,
+  };
+}
+
+function normalizeReplyPayload(payload) {
+  const payloadMediaUrls = Array.isArray(payload?.mediaUrls)
+    ? payload.mediaUrls.filter((entry) => typeof entry === "string" && entry.trim().length > 0)
+    : [];
+  const payloadMediaUrl = typeof payload?.mediaUrl === "string" && payload.mediaUrl.trim()
+    ? [payload.mediaUrl.trim()]
+    : [];
+  const parsed = splitReplyMediaFromText(payload?.text);
+  const normalizedText = normalizePlainRemoteImageUrlsInReply(parsed.text);
+  const visibleRemoteUrls = extractVisibleRemoteUrls(normalizedText);
+
+  const shouldKeepPayloadMediaUrl = (mediaUrl) => {
+    if (!isRemoteHttpUrl(mediaUrl)) {
+      return true;
+    }
+    const normalizedUrl = normalizeVisibleRemoteUrl(mediaUrl);
+    return isRemoteImageUrl(normalizedUrl) || !normalizedUrl;
+  };
+
+  const shouldKeepDirectiveMediaUrl = (mediaUrl) => {
+    if (!isRemoteHttpUrl(mediaUrl)) {
+      return true;
+    }
+    const normalizedUrl = normalizeVisibleRemoteUrl(mediaUrl);
+    return isRemoteImageUrl(normalizedUrl) || !normalizedUrl || !visibleRemoteUrls.has(normalizedUrl);
+  };
+
+  const mediaUrls = mergeReplyMediaUrls(
+    mergeReplyMediaUrls(payloadMediaUrls, payloadMediaUrl).filter(shouldKeepPayloadMediaUrl),
+    parsed.mediaUrls.filter(shouldKeepDirectiveMediaUrl),
+  )
+    .filter((mediaUrl) => {
+      if (!isRemoteHttpUrl(mediaUrl)) {
+        return true;
+      }
+      const normalizedUrl = normalizeVisibleRemoteUrl(mediaUrl);
+      return isRemoteImageUrl(normalizedUrl) || !normalizedUrl || !visibleRemoteUrls.has(normalizedUrl);
+    });
+
+  return {
+    text: normalizedText,
+    mediaUrls,
+  };
+}
+
+function resolveReplyMediaUrls(payload) {
+  return normalizeReplyPayload(payload).mediaUrls;
+}
+
+function applyAccountNetworkConfig(account) {
+  const network = account?.config?.network ?? {};
+  setConfigProxyUrl(network.egressProxyUrl ?? "");
+  setApiBaseUrl(network.apiBaseUrl ?? "");
+}
+
+function stripThinkTags(text) {
+  return String(text ?? "").replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+}
+
+async function sendMediaBatch({ wsClient, frame, state, account, runtime, config, agentId }) {
+  const mediaLocalRoots = resolveReplyMediaLocalRoots(config, agentId);
+
+  for (const mediaUrl of state.pendingMediaUrls) {
+    if (isInlineRemoteReplyImage(mediaUrl)) {
+      continue;
+    }
+
+    const normalizedUrl = normalizeReplyMediaUrlForLoad(mediaUrl, config, agentId);
+    if (!normalizedUrl) {
+      state.hasMediaFailed = true;
+      logger.error(`[WS] Media send failed: url=${mediaUrl}, reason=invalid_local_path`);
+      const summary = buildMediaErrorSummary(mediaUrl, {
+        ok: false,
+        rejectReason: "invalid_local_path",
+        error: "reply media path resolved outside allowed roots",
+      });
+      state.mediaErrorSummary = state.mediaErrorSummary
+        ? `${state.mediaErrorSummary}\n\n${summary}`
+        : summary;
+      continue;
+    }
+
+    const result = await uploadAndReplyMedia({
+      wsClient,
+      frame,
+      mediaUrl: normalizedUrl,
+      mediaLocalRoots,
+      includeDefaultMediaLocalRoots: false,
+      log: (...args) => logger.info(...args),
+      errorLog: (...args) => logger.error(...args),
+    });
+
+    if (result.ok) {
+      state.attachedReplyMediaUrls.push(mediaUrl);
+      state.hasMedia = true;
+      if (result.finalType === "image") {
+        state.hasImageMedia = true;
+      } else {
+        state.hasFileMedia = true;
+      }
+      if (result.downgraded) {
+        logger.info(`[WS] Media downgraded: ${result.downgradeNote}`);
+      }
+    } else {
+      state.hasMediaFailed = true;
+      logger.error(`[WS] Media send failed: url=${mediaUrl}, reason=${result.rejectReason || result.error}`);
+      const summary = buildMediaErrorSummary(mediaUrl, result);
+      state.mediaErrorSummary = state.mediaErrorSummary
+        ? `${state.mediaErrorSummary}\n\n${summary}`
+        : summary;
+    }
+  }
+  state.pendingMediaUrls = [];
+}
+
+function pruneVisibleRemoteReplyMedia(state) {
+  const visibleRemoteUrls = extractVisibleRemoteUrls(state?.accumulatedText ?? "");
+  if (visibleRemoteUrls.size === 0) {
+    return;
+  }
+
+  const shouldKeep = (mediaUrl) => {
+    if (!isRemoteHttpUrl(mediaUrl)) {
+      return true;
+    }
+    const normalizedUrl = normalizeVisibleRemoteUrl(mediaUrl);
+    return isRemoteImageUrl(normalizedUrl) || !normalizedUrl || !visibleRemoteUrls.has(normalizedUrl);
+  };
+
+  state.pendingMediaUrls = (state.pendingMediaUrls ?? []).filter(shouldKeep);
+  state.replyMediaUrls = (state.replyMediaUrls ?? []).filter(shouldKeep);
+}
+
+async function flushQueuedReplyMedia({ wsClient, frame, state, account, runtime, config, agentId }) {
+  pruneVisibleRemoteReplyMedia(state);
+  if (!state.pendingMediaUrls?.length) {
+    return;
+  }
+
+  try {
+    await sendMediaBatch({
+      wsClient, frame, state, account, runtime, config, agentId,
+    });
+    state.accumulatedText = stripAttachedMarkdownImages(
+      state.accumulatedText,
+      state.attachedReplyMediaUrls,
+    );
+  } catch (mediaErr) {
+    state.hasMediaFailed = true;
+    const errMsg = String(mediaErr);
+    const summary = `文件发送失败：内部处理异常，请升级 openclaw 到最新版本后重试。\n错误详情：${errMsg}`;
+    state.mediaErrorSummary = state.mediaErrorSummary
+      ? `${state.mediaErrorSummary}\n\n${summary}`
+      : summary;
+    logger.error(`[WS] sendMediaBatch threw: ${errMsg}`);
+  }
+}
+
+async function finishThinkingStream({ wsClient, frame, state, accountId }) {
+  const visibleText = stripThinkTags(state.accumulatedText);
+  let finishText;
+  let allowEmpty = false;
+
+  if (visibleText) {
+    let finalVisibleText = state.accumulatedText;
+    if (state.hasMediaFailed && state.mediaErrorSummary) {
+      finalVisibleText += `\n\n${state.mediaErrorSummary}`;
+    }
+    finishText = buildWsStreamContent({
+      reasoningText: state.reasoningText,
+      visibleText: finalVisibleText,
+      finish: true,
+    });
+  } else if (state.reasoningText) {
+    // If the model only emitted reasoning tokens, close the thinking stream
+    // instead of replacing it with a generic completion stub.
+    finishText = buildWsStreamContent({
+      reasoningText: state.reasoningText,
+      visibleText: "",
+      finish: true,
+    });
+  } else if (state.hasMedia) {
+    const mediaVisibleText = state.hasImageMedia && !state.hasFileMedia
+      ? "图片已生成，请查收。"
+      : "文件已发送，请查收。";
+    const fallbackReasoningText = state.waitingModelSeconds > 0
+      ? buildWaitingModelReasoningText(state.waitingModelSeconds)
+      : state.hasImageMedia && !state.hasFileMedia
+        ? "正在生成图片"
+        : "正在整理并发送文件";
+    finishText = buildWsStreamContent({
+      reasoningText: fallbackReasoningText,
+      visibleText: mediaVisibleText,
+      finish: true,
+    });
+  } else if (state.hasMediaFailed && state.mediaErrorSummary) {
+    finishText = state.mediaErrorSummary;
+  } else {
+    // Model produced nothing visible/reasoning/media. Close the stream
+    // silently so the WeCom client clears its "⏳ 处理中…" placeholder
+    // without leaving a generic stub message in the conversation.
+    finishText = "";
+    allowEmpty = true;
+  }
+
+  await sendWsReply({
+    wsClient,
+    frame,
+    streamId: state.streamId,
+    text: finishText,
+    finish: true,
+    accountId,
+    allowEmpty,
+  });
+}
+
+function resolveWelcomeMessage(account) {
+  const configured = String(account?.config?.welcomeMessage ?? "").trim();
+  if (configured) {
+    return configured;
+  }
+
+  const fromFile = loadWelcomeMessagesFromFile(account?.config);
+  if (fromFile?.length) {
+    const pick = Math.floor(Math.random() * fromFile.length);
+    return fromFile[pick];
+  }
+
+  const index = Math.floor(Math.random() * DEFAULT_WELCOME_MESSAGES.length);
+  return DEFAULT_WELCOME_MESSAGES[index] || DEFAULT_WELCOME_MESSAGE;
+}
+
+function collectMixedMessageItems({ mixed, textParts, imageUrls, imageAesKeys, fileUrls, fileAesKeys }) {
+  let hasImage = false;
+  let hasFile = false;
+
+  if (!Array.isArray(mixed?.msg_item)) {
+    return { hasImage, hasFile };
+  }
+
+  for (const item of mixed.msg_item) {
+    if (item.msgtype === "text" && item.text?.content) {
+      textParts.push(item.text.content);
+    } else if (item.msgtype === "image" && item.image?.url) {
+      hasImage = true;
+      imageUrls.push(item.image.url);
+      if (item.image.aeskey) {
+        imageAesKeys.set(item.image.url, item.image.aeskey);
+      }
+    } else if (item.msgtype === "file" && item.file?.url) {
+      hasFile = true;
+      fileUrls.push(item.file.url);
+      if (item.file.aeskey) {
+        fileAesKeys.set(item.file.url, item.file.aeskey);
+      }
+    }
+  }
+
+  return { hasImage, hasFile };
+}
+
+function parseMessageContent(body) {
+  const textParts = [];
+  const imageUrls = [];
+  const imageAesKeys = new Map();
+  const fileUrls = [];
+  const fileAesKeys = new Map();
+  let quoteContent;
+
+  if (body?.msgtype === "mixed") {
+    collectMixedMessageItems({
+      mixed: body.mixed,
+      textParts,
+      imageUrls,
+      imageAesKeys,
+      fileUrls,
+      fileAesKeys,
+    });
+  } else {
+    if (body?.text?.content) {
+      textParts.push(body.text.content);
+    }
+    if (body?.msgtype === "voice" && body?.voice?.content) {
+      textParts.push(body.voice.content);
+    }
+    if (body?.image?.url) {
+      imageUrls.push(body.image.url);
+      if (body.image.aeskey) {
+        imageAesKeys.set(body.image.url, body.image.aeskey);
+      }
+    }
+    if (body?.msgtype === "file" && body?.file?.url) {
+      fileUrls.push(body.file.url);
+      if (body.file.aeskey) {
+        fileAesKeys.set(body.file.url, body.file.aeskey);
+      }
+    }
+  }
+
+  if (body?.quote) {
+    if (body.quote.msgtype === "text" && body.quote.text?.content) {
+      quoteContent = body.quote.text.content;
+    } else if (body.quote.msgtype === "voice" && body.quote.voice?.content) {
+      quoteContent = body.quote.voice.content;
+    } else if (body.quote.msgtype === "mixed") {
+      const quoteTextParts = [];
+      const { hasImage } = collectMixedMessageItems({
+        mixed: body.quote.mixed,
+        textParts: quoteTextParts,
+        imageUrls,
+        imageAesKeys,
+        fileUrls,
+        fileAesKeys,
+      });
+      quoteContent = quoteTextParts.join("\n").trim();
+      if (!quoteContent && hasImage) {
+        quoteContent = "[引用图文]";
+      }
+    } else if (body.quote.msgtype === "image" && body.quote.image?.url) {
+      imageUrls.push(body.quote.image.url);
+      if (body.quote.image.aeskey) {
+        imageAesKeys.set(body.quote.image.url, body.quote.image.aeskey);
+      }
+    } else if (body.quote.msgtype === "file" && body.quote.file?.url) {
+      fileUrls.push(body.quote.file.url);
+      if (body.quote.file.aeskey) {
+        fileAesKeys.set(body.quote.file.url, body.quote.file.aeskey);
+      }
+    }
+  }
+
+  return { textParts, imageUrls, imageAesKeys, fileUrls, fileAesKeys, quoteContent };
+}
+
+function mergeMapEntries(target, source) {
+  for (const [key, value] of source.entries()) {
+    target.set(key, value);
+  }
+}
+
+function consumePendingInbound(key) {
+  const pending = pendingInboundMessages.get(key);
+  pendingInboundMessages.delete(key);
+  if (pending && pending.timer) {
+    clearTimeout(pending.timer);
+  }
+  return pending;
+}
+
+function isRetryableMediaDownloadError(error) {
+  const message = String(error?.message ?? error ?? "");
+  return (
+    /\b(429|500|502|503|504)\b/.test(message) ||
+    /timed out|timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|network|socket/i.test(message)
+  );
+}
+
+function delayMs(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+class MediaOversizeError extends Error {
+  constructor({ kind, filename, sizeBytes, maxBytes }) {
+    super(
+      `Media oversize: kind=${kind}, size=${sizeBytes}, max=${maxBytes}` +
+        (filename ? `, filename=${filename}` : ""),
+    );
+    this.name = "MediaOversizeError";
+    this.kind = kind;
+    this.filename = filename;
+    this.sizeBytes = sizeBytes;
+    this.maxBytes = maxBytes;
+  }
+}
+
+async function downloadWeComMediaWithRetry({ wsClient, url, aesKey, type, timeoutMs }) {
+  const maxAttempts = 3;
+  let lastError;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await withTimeout(
+        wsClient.downloadFile(url, aesKey),
+        timeoutMs,
+        `${type} download timed out`,
+      );
+    } catch (error) {
+      lastError = error;
+      if (attempt >= maxAttempts || !isRetryableMediaDownloadError(error)) {
+        throw error;
+      }
+      const waitMs = 300 * attempt;
+      logger.warn(`[WS] ${type} download failed; retrying ${attempt}/${maxAttempts - 1}`, {
+        url,
+        error: error?.message || String(error),
+        waitMs,
+      });
+      await delayMs(waitMs);
+    }
+  }
+
+  throw lastError;
+}
+
+async function downloadAndSaveMedia({ wsClient, urls, aesKeys, type, runtime, config }) {
+  const core = resolveChannelCore(runtime);
+  const timeoutMs = type === "image" ? IMAGE_DOWNLOAD_TIMEOUT_MS : FILE_DOWNLOAD_TIMEOUT_MS;
+  const mediaMaxMb = config?.agents?.defaults?.mediaMaxMb ?? DEFAULT_MEDIA_MAX_MB;
+  const maxBytes = mediaMaxMb * 1024 * 1024;
+  const mediaList = [];
+  const failures = [];
+
+  for (const url of urls) {
+    try {
+      let buffer;
+      let filename;
+      let contentType = type === "image" ? "image/jpeg" : "application/octet-stream";
+
+      try {
+        const result = await downloadWeComMediaWithRetry({ wsClient, url, aesKey: aesKeys?.get(url), type, timeoutMs });
+        buffer = result.buffer;
+        filename = result.filename;
+      } catch (error) {
+        if (aesKeys?.get(url)) {
+          throw error;
+        }
+        logger.debug(`[WS] SDK ${type} download failed, falling back to core media fetch: ${error.message}`);
+        const fetched = await withTimeout(
+          core.media.fetchRemoteMedia({ url }),
+          timeoutMs,
+          `${type} fallback download timed out`,
+        );
+        buffer = fetched.buffer;
+        contentType = fetched.contentType ?? contentType;
+      }
+
+      if (buffer.length > maxBytes) {
+        throw new MediaOversizeError({
+          kind: type,
+          filename,
+          sizeBytes: buffer.length,
+          maxBytes,
+        });
+      }
+
+      const saved = await core.media.saveMediaBuffer(buffer, contentType, "inbound", maxBytes, filename);
+      mediaList.push({ path: saved.path, contentType: saved.contentType });
+    } catch (error) {
+      if (error instanceof MediaOversizeError) {
+        logger.warn(`[WS] ${type} oversize: size=${error.sizeBytes}, max=${error.maxBytes}, filename=${error.filename ?? "(none)"}`);
+        failures.push({
+          url,
+          type,
+          error: error.message,
+          oversize: true,
+          sizeBytes: error.sizeBytes,
+          maxBytes: error.maxBytes,
+          filename: error.filename,
+        });
+      } else {
+        logger.error(`[WS] Failed to download ${type}: ${error.message}`);
+        failures.push({ url, type, error: error?.message || String(error) });
+      }
+    }
+  }
+
+  return { mediaList, failures };
+}
+
+async function sendWsReply({ wsClient, frame, text, finish = true, streamId, msgItem, accountId, allowEmpty = false }) {
+  const normalizedText = normalizeThinkingTags(typeof text === "string" ? text : "");
+  if (!allowEmpty && !normalizedText && (!Array.isArray(msgItem) || msgItem.length === 0)) {
+    return streamId;
+  }
+  if (!wsClient?.isConnected) {
+    throw new Error("WS client is not connected");
+  }
+
+  const chatId = frame?.body?.chatid || frame?.body?.from?.userid;
+  if (finish && accountId && chatId) {
+    const quota = forecastReplyQuota({ accountId, chatId });
+    if (quota.windowActive && (quota.nearLimit || quota.exhausted)) {
+      logger.warn(`[WS:${accountId}] Reply quota is ${quota.exhausted ? "exhausted" : "near limit"}`, {
+        chatId,
+        used: quota.used,
+        limit: quota.limit,
+        remaining: quota.remaining,
+      });
+    }
+  }
+
+  const resolvedStreamId = streamId || generateReqId("stream");
+
+  await withTimeout(
+    wsClient.replyStream(frame, resolvedStreamId, normalizedText, finish, msgItem),
+    REPLY_SEND_TIMEOUT_MS,
+    `Reply timed out (streamId=${resolvedStreamId})`,
+  );
+
+  if (finish && accountId && chatId) {
+    recordPassiveReply({ accountId, chatId });
+  }
+
+  return resolvedStreamId;
+}
+
+async function sendWsPassiveMarkdownReply({ wsClient, frame, text, accountId }) {
+  const content = stripThinkTags(text).trim();
+  if (!content) {
+    return null;
+  }
+  if (!wsClient?.isConnected) {
+    throw new Error("WS client is not connected");
+  }
+  if (typeof wsClient.reply !== "function") {
+    throw new Error("WS client does not support passive markdown replies");
+  }
+
+  const chatId = frame?.body?.chatid || frame?.body?.from?.userid;
+  if (accountId && chatId) {
+    const quota = forecastReplyQuota({ accountId, chatId });
+    if (quota.windowActive && (quota.nearLimit || quota.exhausted)) {
+      logger.warn(`[WS:${accountId}] Reply quota is ${quota.exhausted ? "exhausted" : "near limit"}`, {
+        chatId,
+        used: quota.used,
+        limit: quota.limit,
+        remaining: quota.remaining,
+      });
+    }
+  }
+
+  const result = await withTimeout(
+    wsClient.reply(frame, {
+      msgtype: "markdown",
+      markdown: { content },
+    }),
+    REPLY_SEND_TIMEOUT_MS,
+    "Passive markdown reply timed out",
+  );
+
+  if (accountId && chatId) {
+    recordPassiveReply({ accountId, chatId });
+  }
+
+  return result;
+}
+
+function resolveOutboundChatId(to) {
+  return String(to ?? "")
+    .trim()
+    .replace(/^wecom:/i, "")
+    .replace(/^group:/i, "")
+    .replace(/^user:/i, "");
+}
+
+export async function sendWsMessage({ to, content, accountId = "default" }) {
+  const chatId = resolveOutboundChatId(to);
+  const wsClient = getWsClient(accountId);
+  const outbound = applyOutboundSenderProtocol(content);
+
+  if (!chatId) {
+    throw new Error("Missing chat target for WeCom WS send");
+  }
+  if (!wsClient || !wsClient.isConnected) {
+    throw new Error(`WS client is not connected for account ${accountId}`);
+  }
+
+  const quota = forecastActiveSendQuota({ accountId, chatId });
+  if (quota.nearLimit || quota.exhausted) {
+    logger.warn(`[WS:${accountId}] Active send quota is ${quota.exhausted ? "exhausted" : "near limit"}`, {
+      chatId,
+      bucket: quota.bucket,
+      used: quota.used,
+      limit: quota.limit,
+      remaining: quota.remaining,
+      replyWindowActive: quota.windowActive ?? false,
+    });
+  }
+
+  const body = buildWsActiveSendBody(outbound.content);
+  let result;
+  try {
+    result = await wsClient.sendMessage(chatId, body);
+  } catch (error) {
+    if (body.msgtype !== "markdown_v2") {
+      throw error;
+    }
+    logger.warn(`[WS:${accountId}] markdown_v2 active send failed, falling back to markdown: ${error.message}`);
+    result = await wsClient.sendMessage(chatId, buildWsActiveSendBody(outbound.content, { forceFormat: "markdown" }));
+  }
+
+  recordActiveSend({ accountId, chatId });
+
+  return {
+    channel: CHANNEL_ID,
+    messageId: result?.headers?.req_id ?? `wecom-ws-${Date.now()}`,
+    chatId,
+  };
+}
+
+/**
+ * Flush pending replies via the Agent API after WS reconnection.
+ * Called when the WS authenticates and there are queued unsent final replies.
+ */
+async function flushPendingRepliesViaAgentApi(account) {
+  const entries = drainPendingReplies(account.accountId);
+  if (entries.length === 0) {
+    return;
+  }
+
+  logger.info(`[WS:${account.accountId}] Flushing ${entries.length} pending replies via Agent API`);
+  applyAccountNetworkConfig(account);
+
+  for (const entry of entries) {
+    try {
+      const target = entry.isGroupChat ? { chatId: entry.chatId } : { toUser: entry.senderId };
+      await agentSendText({
+        agent: account.agentCredentials,
+        ...target,
+        text: entry.text,
+      });
+      recordOutboundActivity({ accountId: account.accountId });
+      logger.info(`[WS:${account.accountId}] Pending reply delivered via Agent API`, {
+        chatId: entry.chatId,
+        senderId: entry.senderId,
+        textLength: entry.text.length,
+      });
+    } catch (sendError) {
+      logger.error(`[WS:${account.accountId}] Failed to deliver pending reply via Agent API: ${sendError.message}`, {
+        chatId: entry.chatId,
+        senderId: entry.senderId,
+      });
+    }
+  }
+}
+
+async function sendThinkingReply({ wsClient, frame, streamId, text = THINKING_MESSAGE }) {
+  try {
+    await sendWsReply({
+      wsClient,
+      frame,
+      streamId,
+      text,
+      finish: false,
+    });
+  } catch (error) {
+    logger.error(`[WS] Failed to send thinking reply: ${error.message}`);
+  }
+}
+
+async function flushInboundDebounce(key, account, config, runtime, wsClient, reqIdStore) {
+  const pending = consumePendingInbound(key);
+  if (!pending || pending.items.length === 0) return;
+
+  // Text: include ALL items. The recursive call's body parse is wiped by the
+  // textParts.length=0 reassignment below, so we must include every item here.
+  // (An earlier "fix" used slice(0,-1) on the assumption that two merge paths
+  // would APPEND -- but they actually REPLACE, which silently dropped the last
+  // item's text from any batch with >= 2 messages.)
+  // Images/Files: include ALL items, including the last one. The recursive
+  // call's body parse loses the original image data (the plugin replaces the
+  // body reference after download), so we MUST replay the saved URLs.
+  const allTextParts = [];
+  const allImageUrls = [];
+  const allFileUrls = [];
+  const allImageAesKeys = new Map();
+  const allFileAesKeys = new Map();
+  const itemsForText = pending.items;
+  const itemsForMedia = pending.items;
+  for (const item of itemsForText) {
+    for (const t of item.textParts) allTextParts.push(t);
+  }
+  for (const item of itemsForMedia) {
+    for (const u of item.imageUrls || []) allImageUrls.push(u);
+    for (const u of item.fileUrls || []) allFileUrls.push(u);
+    mergeMapEntries(allImageAesKeys, item.imageAesKeys);
+    mergeMapEntries(allFileAesKeys, item.fileAesKeys);
+  }
+
+  logger.info(`[WS:${account.accountId}] Flushing debounced inbound batch`, {
+    messageCount: pending.items.length,
+    textLength: allTextParts.join("\n").length,
+    messageIds: pending.items.map((i) => i.messageId),
+    windowMs: INBOUND_DEBOUNCE_MS,
+  });
+
+  const lastItem = pending.items[pending.items.length - 1];
+  void processWsMessage({
+    frame: lastItem.frame,
+    account,
+    config,
+    runtime,
+    wsClient,
+    reqIdStore,
+    skipDedup: true,
+    skipInboundDebounce: true,
+    preAggregatedText: allTextParts,
+    preAggregatedAttachments: {
+      imageUrls: allImageUrls,
+      imageAesKeys: allImageAesKeys,
+      fileUrls: allFileUrls,
+      fileAesKeys: allFileAesKeys,
+    },
+  });
+}
+
+function buildInboundContext({
+  runtime,
+  config,
+  account,
+  frame,
+  body,
+  text,
+  mediaList,
+  route,
+  senderId,
+  chatId,
+  isGroupChat,
+}) {
+  const core = resolveChannelCore(runtime);
+  const storePath = core.session.resolveStorePath(config.session?.store, { agentId: route.agentId });
+  const envelopeOptions = core.reply.resolveEnvelopeFormatOptions(config);
+  const previousTimestamp = core.session.readSessionUpdatedAt({
+    storePath,
+    sessionKey: route.sessionKey,
+  });
+
+  const senderLabel = isGroupChat ? `[${senderId}]` : senderId;
+  const hasImages = mediaList.some((entry) => entry.contentType?.startsWith("image/"));
+  const messageBody =
+    text || (mediaList.length > 0 ? (hasImages ? MEDIA_IMAGE_PLACEHOLDER : MEDIA_DOCUMENT_PLACEHOLDER) : "");
+  const formattedBody = core.reply.formatAgentEnvelope({
+    channel: isGroupChat ? "Enterprise WeChat Group" : "Enterprise WeChat",
+    from: senderLabel,
+    timestamp: Date.now(),
+    previousTimestamp,
+    envelope: envelopeOptions,
+    body: messageBody,
+  });
+
+  const context = {
+    Body: formattedBody || messageBody,
+    BodyForAgent: buildBodyForAgent(formattedBody || messageBody, config, route.agentId),
+    RawBody: text || messageBody,
+    CommandBody: text || messageBody,
+    MessageSid: body.msgid,
+    From: isGroupChat ? `${CHANNEL_ID}:group:${chatId}` : `${CHANNEL_ID}:${senderId}`,
+    To: isGroupChat ? `${CHANNEL_ID}:group:${chatId}` : `${CHANNEL_ID}:${senderId}`,
+    SenderId: senderId,
+    SessionKey: route.sessionKey,
+    AccountId: account.accountId,
+    ChatType: isGroupChat ? "group" : "direct",
+    ConversationLabel: isGroupChat ? `Group ${chatId}` : senderId,
+    SenderName: senderId,
+    GroupId: isGroupChat ? chatId : undefined,
+    Timestamp: Date.now(),
+    SourceTimestamp: normalizeWecomCreateTimeMs(body?.create_time) || undefined,
+    Provider: CHANNEL_ID,
+    Surface: CHANNEL_ID,
+    OriginatingChannel: CHANNEL_ID,
+    OriginatingTo: isGroupChat ? `${CHANNEL_ID}:group:${chatId}` : `${CHANNEL_ID}:${senderId}`,
+    CommandAuthorized: true,
+    // frame is null for callback-inbound path; use body.msgid as fallback
+    ReqId: frame?.headers?.req_id ?? body?.msgid ?? "",
+    WeComFrame: frame ?? null,
+  };
+
+  if (mediaList.length > 0) {
+    context.MediaPaths = mediaList.map((entry) => entry.path);
+    context.MediaTypes = mediaList.map((entry) => entry.contentType).filter(Boolean);
+
+    if (!text) {
+      const imageCount = mediaList.filter((entry) => entry.contentType?.startsWith("image/")).length;
+      context.Body =
+        imageCount > 1 ? `[用户发送了${imageCount}张图片]` : imageCount === 1 ? "[用户发送了一张图片]" : "[用户发送了文件]";
+      context.RawBody = imageCount > 0 ? "[图片]" : "[文件]";
+      context.CommandBody = "";
+    }
+  }
+
+  return { ctxPayload: core.reply.finalizeInboundContext(context), storePath };
+}
+
+async function processWsMessage({
+  frame,
+  account,
+  config,
+  runtime,
+  wsClient,
+  reqIdStore,
+  skipDedup = false,
+  skipInboundDebounce = false,
+  preAggregatedAttachments = null,
+  preAggregatedText = null,
+}) {
+  const core = resolveChannelCore(runtime);
+  const body = frame?.body ?? {};
+  const senderId = body?.from?.userid;
+  const chatId = body?.chatid || senderId;
+  const messageId = body?.msgid;
+  const reqId = frame?.headers?.req_id;
+  const isGroupChat = body?.chattype === "group";
+
+  if (!senderId || !chatId || !messageId || !reqId) {
+    logger.warn("[WS] Ignoring malformed frame", {
+      hasSender: Boolean(senderId),
+      hasChatId: Boolean(chatId),
+      hasMessageId: Boolean(messageId),
+      hasReqId: Boolean(reqId),
+    });
+    return;
+  }
+
+  const dedupKey = `${account.accountId}:${messageId}`;
+  if (!skipDedup && inboundMessageDeduplicator.isDuplicate(dedupKey)) {
+    logger.debug(`[WS:${account.accountId}] Ignoring duplicate inbound message`, {
+      messageId,
+      senderId,
+      chatId,
+    });
+    return;
+  }
+
+  const perfStartedAt = Date.now();
+  const sourceTiming = getWecomSourceTiming(body?.create_time, perfStartedAt);
+  const perfState = {
+    firstReasoningReceivedAt: 0,
+    firstReasoningForwardedAt: 0,
+    firstVisibleReceivedAt: 0,
+    firstVisibleForwardedAt: 0,
+    thinkingSentAt: 0,
+    finalReplySentAt: 0,
+  };
+  const logPerf = (stage, extra = {}) => {
+    logger.info(`[WSPERF:${account.accountId}] ${stage}`, {
+      messageId,
+      senderId,
+      chatId,
+      isGroupChat,
+      elapsedMs: Date.now() - perfStartedAt,
+      ...extra,
+    });
+  };
+
+  recordInboundMessage({ accountId: account.accountId, chatId });
+
+  const { textParts, imageUrls, imageAesKeys, fileUrls, fileAesKeys, quoteContent } = parseMessageContent(body);
+  if (preAggregatedAttachments) {
+    imageUrls.splice(0, imageUrls.length, ...preAggregatedAttachments.imageUrls);
+    fileUrls.splice(0, fileUrls.length, ...preAggregatedAttachments.fileUrls);
+    imageAesKeys.clear();
+    fileAesKeys.clear();
+    mergeMapEntries(imageAesKeys, preAggregatedAttachments.imageAesKeys);
+    mergeMapEntries(fileAesKeys, preAggregatedAttachments.fileAesKeys);
+  }
+  if (preAggregatedText && preAggregatedText.length > 0) {
+    textParts.length = 0;
+    textParts.push(...preAggregatedText);
+  }
+  const originalText = textParts.join("\n").trim();
+  let text = originalText;
+
+  logger.info(`[WS:${account.accountId}] ← inbound`, {
+    senderId,
+    chatId,
+    isGroupChat,
+    messageId,
+    ...sourceTiming,
+    textLength: originalText.length,
+    imageCount: imageUrls.length,
+    fileCount: fileUrls.length,
+    preview: originalText.slice(0, 80) || (imageUrls.length ? "[image]" : fileUrls.length ? "[file]" : ""),
+  });
+  logPerf("inbound", sourceTiming);
+
+  if (!text && quoteContent) {
+    text = quoteContent;
+  }
+
+  // Inbound debounce: buffer messages from the same (account, chat, sender)
+  // for INBOUND_DEBOUNCE_MS, then dispatch all as a single batch.
+  if (!skipInboundDebounce) {
+    const debounceKey = `${account.accountId}:${chatId}:${senderId}`;
+    const existing = pendingInboundMessages.get(debounceKey);
+
+    if (existing) {
+      existing.items.push({
+        frame,
+        messageId,
+        textParts: [...textParts],
+        imageUrls: [...imageUrls],
+        fileUrls: [...fileUrls],
+        imageAesKeys: new Map(imageAesKeys),
+        fileAesKeys: new Map(fileAesKeys),
+      });
+      clearTimeout(existing.timer);
+      existing.timer = setTimeout(
+        () => { void flushInboundDebounce(debounceKey, account, config, runtime, wsClient, reqIdStore); },
+        INBOUND_DEBOUNCE_MS,
+      );
+      logger.debug(`[WS:${account.accountId}] Buffered inbound message for debounce`, {
+        messageId,
+        chatId,
+        senderId,
+        bufferedCount: existing.items.length,
+        windowMs: INBOUND_DEBOUNCE_MS,
+      });
+      return;
+    }
+
+    const initialTimer = setTimeout(
+      () => { void flushInboundDebounce(debounceKey, account, config, runtime, wsClient, reqIdStore); },
+      INBOUND_DEBOUNCE_MS,
+    );
+    pendingInboundMessages.set(debounceKey, {
+      timer: initialTimer,
+      items: [{
+        frame,
+        messageId,
+        textParts: [...textParts],
+        imageUrls: [...imageUrls],
+        fileUrls: [...fileUrls],
+        imageAesKeys: new Map(imageAesKeys),
+        fileAesKeys: new Map(fileAesKeys),
+      }],
+    });
+    logger.debug(`[WS:${account.accountId}] Inbound debounce window opened`, {
+      messageId,
+      chatId,
+      senderId,
+      windowMs: INBOUND_DEBOUNCE_MS,
+    });
+    return;
+  }
+
+  if (body?.quote && quoteContent && text && quoteContent !== text) {
+    const quoteLabel =
+      body.quote.msgtype === "image"
+        ? "[引用图片]"
+        : body.quote.msgtype === "mixed" && quoteContent === "[引用图文]"
+          ? "[引用图文]"
+          : `> ${quoteContent}`;
+    text = `${quoteLabel}\n\n${text}`;
+  }
+
+  if (!text && imageUrls.length === 0 && fileUrls.length === 0) {
+    logger.debug("[WS] Ignoring empty message", { chatId, senderId, accountId: account.accountId });
+    return;
+  }
+
+  if (isGroupChat) {
+    const groupPolicyResult = checkGroupPolicy({ chatId, senderId, account, config });
+    if (!groupPolicyResult.allowed) {
+      return;
+    }
+  }
+
+  const dmPolicyResult = await checkDmPolicy({
+    senderId,
+    isGroup: isGroupChat,
+    account,
+    wsClient,
+    frame,
+    core,
+    sendReply: async ({ frame: replyFrame, text: replyText, finish, streamId }) => {
+      await sendWsReply({
+        wsClient,
+        frame: replyFrame,
+        text: replyText,
+        finish,
+        streamId,
+        accountId: account.accountId,
+      });
+    },
+  });
+  if (!dmPolicyResult.allowed) {
+    return;
+  }
+
+  if (isGroupChat) {
+    if (!shouldTriggerGroupResponse(originalText, account.config)) {
+      logger.debug("[WS] Group message ignored because mention gating was not satisfied", {
+        accountId: account.accountId,
+        chatId,
+        senderId,
+      });
+      return;
+    }
+    text = extractGroupMessageContent(originalText, account.config);
+    if (!text.trim() && imageUrls.length === 0 && fileUrls.length === 0) {
+      logger.debug("[WS] Group message mention stripped to empty content; skipping reply", {
+        accountId: account.accountId,
+        chatId,
+        senderId,
+      });
+      return;
+    }
+  }
+
+  const senderIsAdmin = isWecomAdmin(senderId, account.config);
+  const commandAuthorized = resolveWecomCommandAuthorized({
+    cfg: config,
+    accountId: account.accountId,
+    senderId,
+  });
+  const commandCheck = checkCommandAllowlist(text, account.config);
+  if (commandCheck.isCommand && !commandCheck.allowed && !senderIsAdmin) {
+    await sendWsReply({
+      wsClient,
+      frame,
+      streamId: generateReqId("command"),
+      text: getCommandConfig(account.config).blockMessage,
+      finish: true,
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  const [imageDownload, fileDownload] = await Promise.all([
+    downloadAndSaveMedia({
+      wsClient,
+      urls: imageUrls,
+      aesKeys: imageAesKeys,
+      type: "image",
+      runtime,
+      config,
+    }),
+    downloadAndSaveMedia({
+      wsClient,
+      urls: fileUrls,
+      aesKeys: fileAesKeys,
+      type: "file",
+      runtime,
+      config,
+    }),
+  ]);
+  const imageMediaList = imageDownload.mediaList;
+  const fileMediaList = fileDownload.mediaList;
+  const mediaDownloadFailures = [...imageDownload.failures, ...fileDownload.failures];
+  const mediaList = [...imageMediaList, ...fileMediaList];
+  logPerf("media_ready", {
+    imageCount: imageMediaList.length,
+    fileCount: fileMediaList.length,
+    failedCount: mediaDownloadFailures.length,
+  });
+
+  if (mediaDownloadFailures.length > 0) {
+    const oversize = mediaDownloadFailures.find((entry) => entry.oversize);
+    let failureText;
+    if (oversize) {
+      const maxMb = oversize.maxBytes / 1024 / 1024;
+      failureText = `当前 OpenClaw 限制附件不超过 ${maxMb}MB，请减小附件再重发，或调整 agents.defaults.mediaMaxMb 后重启 Gateway。`;
+    } else {
+      const failedTypes = [...new Set(mediaDownloadFailures.map((entry) => entry.type === "image" ? "图片" : "文件"))];
+      const firstError = mediaDownloadFailures[0]?.error ? `\n错误详情：${mediaDownloadFailures[0].error}` : "";
+      failureText = [
+        `${failedTypes.join("、")}下载失败，暂时无法处理附件内容。`,
+        `企业微信接口可能临时返回 503/超时，请稍后重发附件再试。${firstError}`,
+      ].join("\n");
+    }
+    logger.warn(`[WS:${account.accountId}] Inbound media download failed; replying without dispatch`, {
+      chatId,
+      senderId,
+      failures: mediaDownloadFailures,
+    });
+    await sendWsReply({
+      wsClient,
+      frame,
+      streamId: generateReqId(oversize ? "media-oversize" : "media-download-failed"),
+      text: failureText,
+      finish: true,
+      accountId: account.accountId,
+    });
+    return;
+  }
+
+  const streamId = reqIdStore?.getSync(chatId) ?? generateReqId("stream");
+  if (reqIdStore) reqIdStore.set(chatId, streamId);
+  const state = {
+    accumulatedText: "",
+    reasoningText: "",
+    streamId,
+    streamCreatedAt: Date.now(),
+    replyMediaUrls: [],
+    pendingMediaUrls: [],
+    attachedReplyMediaUrls: [],
+    hasMedia: false,
+    hasImageMedia: false,
+    hasFileMedia: false,
+    hasMediaFailed: false,
+    mediaErrorSummary: "",
+    deliverCalled: false,
+    waitingModelSeconds: 0,
+    forcePassiveMarkdown: false,
+  };
+  setMessageState(messageId, state);
+
+  // Throttle reasoning and visible text stream updates to avoid exceeding
+  // the SDK's per-reqId reply queue limit (100).
+  let streamMessagesSent = 0;
+  let lastReasoningSendAt = 0;
+  let pendingReasoningTimer = null;
+  let lastVisibleSendAt = 0;
+  let pendingVisibleTimer = null;
+  let lastStreamSentAt = 0;
+  let lastNonEmptyStreamText = "";
+  let lastForwardedVisibleText = "";
+  let keepaliveTimer = null;
+  let rotationTimer = null;
+  let waitingModelTimer = null;
+  let waitingModelSeconds = 0;
+  let waitingModelActive = false;
+
+  const canSendIntermediate = () => streamMessagesSent < MAX_INTERMEDIATE_STREAM_MESSAGES;
+
+  const stopWaitingModelUpdates = () => {
+    waitingModelActive = false;
+    if (waitingModelTimer) {
+      clearTimeout(waitingModelTimer);
+      waitingModelTimer = null;
+    }
+  };
+
+  const sendWaitingModelUpdate = async (seconds) => {
+    const waitingText = buildWaitingModelContent(seconds);
+    state.waitingModelSeconds = seconds;
+    lastStreamSentAt = Date.now();
+    lastNonEmptyStreamText = waitingText;
+    try {
+      streamMessagesSent++;
+      await sendWsReply({
+        wsClient,
+        frame,
+        streamId: state.streamId,
+        text: waitingText,
+        finish: false,
+        accountId: account.accountId,
+      });
+      logPerf("waiting_model_forwarded", {
+        seconds,
+        streamMessagesSent,
+        chars: waitingText.length,
+      });
+    } catch (error) {
+      logger.warn(`[WS] Waiting-model stream send failed (non-fatal): ${error.message}`);
+    }
+  };
+
+  const scheduleWaitingModelUpdate = () => {
+    if (!waitingModelActive) {
+      return;
+    }
+    if (waitingModelTimer) {
+      clearTimeout(waitingModelTimer);
+    }
+    waitingModelTimer = setTimeout(async () => {
+      waitingModelTimer = null;
+      if (!waitingModelActive || !canSendIntermediate()) {
+        return;
+      }
+      waitingModelSeconds += 1;
+      await sendWaitingModelUpdate(waitingModelSeconds);
+      scheduleWaitingModelUpdate();
+    }, WAITING_MODEL_TICK_MS);
+  };
+
+  const sendReasoningUpdate = async () => {
+    if (!canSendIntermediate()) return;
+    lastReasoningSendAt = Date.now();
+    lastStreamSentAt = lastReasoningSendAt;
+    const streamText = buildWsStreamContent({
+      reasoningText: state.reasoningText,
+      visibleText: state.accumulatedText,
+      finish: false,
+    });
+    if (streamText) {
+      lastNonEmptyStreamText = streamText;
+    }
+    try {
+      streamMessagesSent++;
+      await sendWsReply({
+        wsClient,
+        frame,
+        streamId: state.streamId,
+        text: streamText,
+        finish: false,
+        accountId: account.accountId,
+      });
+      if (!perfState.firstReasoningForwardedAt) {
+        perfState.firstReasoningForwardedAt = Date.now();
+        logPerf("first_reasoning_forwarded", {
+          streamMessagesSent,
+          chars: streamText.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(`[WS] Reasoning stream send failed (non-fatal): ${error.message}`);
+    }
+  };
+
+  const sendVisibleUpdate = async () => {
+    if (!canSendIntermediate()) return;
+    lastVisibleSendAt = Date.now();
+    lastStreamSentAt = lastVisibleSendAt;
+    const visibleText = state.accumulatedText;
+    const streamText = buildWsStreamContent({
+      reasoningText: state.reasoningText,
+      visibleText,
+      finish: false,
+    });
+    if (streamText) {
+      lastNonEmptyStreamText = streamText;
+    }
+    lastForwardedVisibleText = visibleText;
+    try {
+      streamMessagesSent++;
+      await sendWsReply({
+        wsClient,
+        frame,
+        streamId: state.streamId,
+        text: streamText,
+        finish: false,
+        accountId: account.accountId,
+      });
+      if (!perfState.firstVisibleForwardedAt) {
+        perfState.firstVisibleForwardedAt = Date.now();
+        logPerf("first_visible_forwarded", {
+          streamMessagesSent,
+          chars: streamText.length,
+        });
+      }
+    } catch (error) {
+      logger.warn(`[WS] Visible stream send failed (non-fatal): ${error.message}`);
+    }
+  };
+
+  const flushPendingStreamUpdates = async () => {
+    const hadPendingReasoning = Boolean(pendingReasoningTimer);
+    const hadPendingVisible = Boolean(pendingVisibleTimer);
+
+    if (pendingReasoningTimer) {
+      clearTimeout(pendingReasoningTimer);
+      pendingReasoningTimer = null;
+    }
+    if (pendingVisibleTimer) {
+      clearTimeout(pendingVisibleTimer);
+      pendingVisibleTimer = null;
+    }
+
+    if (hadPendingReasoning) {
+      const visibleText = hadPendingVisible ? state.accumulatedText : lastForwardedVisibleText;
+      const streamText = buildWsStreamContent({
+        reasoningText: state.reasoningText,
+        visibleText,
+        finish: false,
+      });
+      if (!streamText || streamText === lastNonEmptyStreamText) {
+        return;
+      }
+      lastReasoningSendAt = Date.now();
+      lastStreamSentAt = lastReasoningSendAt;
+      lastNonEmptyStreamText = streamText;
+      if (hadPendingVisible) {
+        lastForwardedVisibleText = visibleText;
+      }
+      try {
+        streamMessagesSent++;
+        await sendWsReply({
+          wsClient,
+          frame,
+          streamId: state.streamId,
+          text: streamText,
+          finish: false,
+          accountId: account.accountId,
+        });
+        if (!perfState.firstReasoningForwardedAt) {
+          perfState.firstReasoningForwardedAt = Date.now();
+          logPerf("first_reasoning_forwarded", {
+            streamMessagesSent,
+            chars: streamText.length,
+          });
+        }
+      } catch (error) {
+        logger.warn(`[WS] Reasoning stream send failed (non-fatal): ${error.message}`);
+      }
+      return;
+    }
+    if (hadPendingVisible) {
+      await sendVisibleUpdate();
+    }
+  };
+
+  const scheduleKeepalive = () => {
+    if (keepaliveTimer) clearTimeout(keepaliveTimer);
+    keepaliveTimer = setTimeout(async () => {
+      keepaliveTimer = null;
+      if (!canSendIntermediate()) return;
+      const idle = Date.now() - lastStreamSentAt;
+      if (idle < STREAM_KEEPALIVE_INTERVAL_MS) {
+        // A real update was sent recently; wait remaining time then send immediately.
+        const remaining = STREAM_KEEPALIVE_INTERVAL_MS - idle;
+        keepaliveTimer = setTimeout(async () => {
+          keepaliveTimer = null;
+          if (!canSendIntermediate()) return;
+          logger.debug(`[WS] Sending stream keepalive after deferred wait (idle ${Math.round((Date.now() - lastStreamSentAt) / 1000)}s)`);
+          lastStreamSentAt = Date.now();
+          const keepaliveText = resolveWsKeepaliveContent({
+            reasoningText: state.reasoningText,
+            visibleText: state.accumulatedText,
+            lastStreamText: lastNonEmptyStreamText,
+          });
+          if (keepaliveText) {
+            lastNonEmptyStreamText = keepaliveText;
+          }
+          try {
+            streamMessagesSent++;
+            await sendWsReply({
+              wsClient,
+              frame,
+              streamId: state.streamId,
+              text: keepaliveText,
+              finish: false,
+              accountId: account.accountId,
+            });
+          } catch (err) {
+            logger.warn(`[WS] Keepalive send failed (non-fatal): ${err.message}`);
+          }
+          scheduleKeepalive();
+        }, remaining);
+        return;
+      }
+      logger.debug(`[WS] Sending stream keepalive (idle ${Math.round(idle / 1000)}s)`);
+      lastStreamSentAt = Date.now();
+      const keepaliveText = resolveWsKeepaliveContent({
+        reasoningText: state.reasoningText,
+        visibleText: state.accumulatedText,
+        lastStreamText: lastNonEmptyStreamText,
+      });
+      if (keepaliveText) {
+        lastNonEmptyStreamText = keepaliveText;
+      }
+      try {
+        streamMessagesSent++;
+        await sendWsReply({
+          wsClient,
+          frame,
+          streamId: state.streamId,
+          text: keepaliveText,
+          finish: false,
+          accountId: account.accountId,
+        });
+      } catch (error) {
+        logger.warn(`[WS] Stream keepalive send failed (non-fatal): ${error.message}`);
+      }
+      scheduleKeepalive();
+    }, STREAM_KEEPALIVE_INTERVAL_MS);
+  };
+
+  // --- Stream rotation: finish the current stream before the 6-minute hard
+  //     limit and seamlessly continue on a new streamId. ----
+
+  const rotateStream = async () => {
+    // Flush any pending throttled updates to the current stream first.
+    await flushPendingStreamUpdates();
+
+    const oldStreamId = state.streamId;
+    const hasVisibleText = Boolean(stripThinkTags(state.accumulatedText));
+
+    // Build finish content.  When still in the thinking phase (no visible
+    // text yet), append a small marker so the finished message is not empty.
+    const finishText = buildWsStreamContent({
+      reasoningText: state.reasoningText,
+      visibleText: hasVisibleText ? state.accumulatedText : "⏳ 处理中…",
+      finish: true,
+    });
+
+    try {
+      streamMessagesSent++;
+      await sendWsReply({
+        wsClient,
+        frame,
+        streamId: oldStreamId,
+        text: finishText,
+        finish: true,
+        accountId: account.accountId,
+      });
+    } catch (err) {
+      logger.warn(`[WS] Stream rotation: failed to finish old stream: ${err.message}`);
+    }
+
+    // Switch to new stream.
+    const newStreamId = generateReqId("stream");
+    state.streamId = newStreamId;
+    state.streamCreatedAt = Date.now();
+    state.accumulatedText = "";
+    state.reasoningText = "";
+
+    // Reset per-stream counters.
+    streamMessagesSent = 0;
+    lastStreamSentAt = Date.now();
+    lastReasoningSendAt = 0;
+    lastVisibleSendAt = 0;
+    lastNonEmptyStreamText = "";
+    lastForwardedVisibleText = "";
+
+    if (reqIdStore) reqIdStore.set(chatId, newStreamId);
+
+    logPerf("stream_rotated", { oldStreamId, newStreamId });
+
+    // Re-arm timers for the new stream.
+    scheduleRotation();
+    scheduleKeepalive();
+  };
+
+  const scheduleRotation = () => {
+    if (rotationTimer) clearTimeout(rotationTimer);
+    const remaining = STREAM_MAX_LIFETIME_MS - (Date.now() - state.streamCreatedAt);
+    if (remaining <= 0) {
+      void rotateStream();
+      return;
+    }
+    rotationTimer = setTimeout(() => {
+      rotationTimer = null;
+      void rotateStream();
+    }, remaining);
+  };
+
+  const cancelPendingTimers = () => {
+    if (pendingReasoningTimer) {
+      clearTimeout(pendingReasoningTimer);
+      pendingReasoningTimer = null;
+    }
+    if (pendingVisibleTimer) {
+      clearTimeout(pendingVisibleTimer);
+      pendingVisibleTimer = null;
+    }
+    if (keepaliveTimer) {
+      clearTimeout(keepaliveTimer);
+      keepaliveTimer = null;
+    }
+    if (rotationTimer) {
+      clearTimeout(rotationTimer);
+      rotationTimer = null;
+    }
+    stopWaitingModelUpdates();
+  };
+
+  const cleanupState = () => {
+    deleteMessageState(messageId);
+    cancelPendingTimers();
+  };
+
+  if (account.sendThinkingMessage !== false) {
+    waitingModelActive = true;
+    waitingModelSeconds = 1;
+    state.waitingModelSeconds = waitingModelSeconds;
+    await sendThinkingReply({
+      wsClient,
+      frame,
+      streamId,
+      text: buildWaitingModelContent(waitingModelSeconds),
+    });
+    lastNonEmptyStreamText = buildWaitingModelContent(waitingModelSeconds);
+    perfState.thinkingSentAt = Date.now();
+    logPerf("thinking_sent", { streamId });
+    scheduleWaitingModelUpdate();
+  }
+  lastStreamSentAt = Date.now();
+  scheduleKeepalive();
+  scheduleRotation();
+
+  const peerKind = isGroupChat ? "group" : "dm";
+  const peerId = isGroupChat ? chatId : senderId;
+  const dynamicConfig = getDynamicAgentConfig(account.config);
+  const dynamicAgentId =
+    dynamicConfig.enabled &&
+    shouldUseDynamicAgent({ chatType: peerKind, config: account.config, senderIsAdmin })
+      ? generateAgentId(peerKind, peerId, account.accountId)
+      : null;
+
+  const route = core.routing.resolveAgentRoute({
+    cfg: config,
+    channel: CHANNEL_ID,
+    accountId: account.accountId,
+    peer: { kind: peerKind, id: peerId },
+  });
+
+  const hasExplicitBinding =
+    Array.isArray(config?.bindings) &&
+    config.bindings.some(
+      (binding) => binding.match?.channel === CHANNEL_ID && binding.match?.accountId === account.accountId,
+    );
+
+  if (dynamicAgentId && !hasExplicitBinding) {
+    const routeAgentId = route.agentId;
+    // Use the account's configured agentId as the base for property inheritance
+    // (model, subagents, tools). route.agentId may resolve to "main" when
+    // there is no explicit binding, but the account's agentId points to the
+    // actual parent agent whose properties the dynamic agent should inherit.
+    const baseAgentId = account.config.agentId || routeAgentId;
+    await ensureDynamicAgentListed(dynamicAgentId, account.config.workspaceTemplate, baseAgentId, {
+      persistToConfig: account.config.dynamicAgents?.persistToConfig === true,
+    });
+    route.sessionKey = route.sessionKey.replace(`agent:${routeAgentId}:`, `agent:${dynamicAgentId}:`);
+    route.agentId = dynamicAgentId;
+  }
+
+  const { ctxPayload, storePath } = buildInboundContext({
+    runtime,
+    config,
+    account,
+    frame,
+    body,
+    text,
+    mediaList,
+    route,
+    senderId,
+    chatId,
+    isGroupChat,
+  });
+  ctxPayload.CommandAuthorized = commandAuthorized;
+  setSessionChatInfo(ctxPayload.SessionKey ?? route.sessionKey, {
+    chatId,
+    chatType: isGroupChat ? "group" : "single",
+  });
+
+  const sessionReasoningMeta = await ensureDefaultSessionReasoningLevel({
+    core,
+    storePath,
+    sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+    ctx: ctxPayload,
+    channelTag: "WS",
+  });
+
+  const runDispatch = async () => {
+    let cleanedUp = false;
+    const safeCleanup = () => {
+      if (cleanedUp) {
+        return;
+      }
+      cleanedUp = true;
+      cleanupState();
+    };
+
+    try {
+      logPerf("dispatch_start", {
+        routeAgentId: route.agentId,
+        sessionKey: route.sessionKey,
+        mediaCount: mediaList.length,
+        ...sourceTiming,
+      });
+      await streamContext.run(
+        { streamId, streamKey: peerId, agentId: route.agentId, accountId: account.accountId },
+        async () => {
+          await core.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: ctxPayload,
+            cfg: buildCfgForDispatch(config),
+            replyOptions: {
+              disableBlockStreaming: false,
+              onReasoningStream: async (payload) => {
+                const nextReasoning = normalizeReasoningStreamText(payload?.text);
+                if (!nextReasoning) {
+                  return;
+                }
+                stopWaitingModelUpdates();
+                state.reasoningText = nextReasoning;
+                if (!perfState.firstReasoningReceivedAt) {
+                  perfState.firstReasoningReceivedAt = Date.now();
+                  logPerf("first_reasoning_received", {
+                    chars: nextReasoning.length,
+                  });
+                }
+
+                // Throttle: skip if sent recently, schedule a trailing update instead.
+                const elapsed = Date.now() - lastReasoningSendAt;
+                if (elapsed < REASONING_STREAM_THROTTLE_MS) {
+                  if (!pendingReasoningTimer) {
+                    pendingReasoningTimer = setTimeout(async () => {
+                      pendingReasoningTimer = null;
+                      await sendReasoningUpdate();
+                    }, REASONING_STREAM_THROTTLE_MS - elapsed);
+                  }
+                  return;
+                }
+                await sendReasoningUpdate();
+              },
+            },
+            dispatcherOptions: {
+              deliver: async (payload, info) => {
+                state.deliverCalled = true;
+                const normalized = normalizeReplyPayload(payload);
+                const chunk = normalized.text;
+                const mediaUrls = normalized.mediaUrls;
+
+                if (chunk) {
+                  stopWaitingModelUpdates();
+                  state.accumulatedText += chunk;
+                }
+
+                for (const mediaUrl of mediaUrls) {
+                  if (!state.replyMediaUrls.includes(mediaUrl)) {
+                    state.replyMediaUrls.push(mediaUrl);
+                    state.pendingMediaUrls.push(mediaUrl);
+                  }
+                }
+
+                const passiveMarkdownCandidate = buildPassiveMarkdownReplyText(
+                  state.accumulatedText,
+                  state.replyMediaUrls,
+                );
+                if (shouldUsePassiveMarkdownReply(passiveMarkdownCandidate, state.replyMediaUrls)) {
+                  state.forcePassiveMarkdown = true;
+                  cancelPendingTimers();
+                  return;
+                }
+
+                if (!perfState.firstVisibleReceivedAt && chunk?.trim()) {
+                  perfState.firstVisibleReceivedAt = Date.now();
+                  logPerf("first_visible_received", {
+                    chars: chunk.length,
+                  });
+                }
+
+                if (info.kind !== "final") {
+                  const hasText = stripThinkTags(state.accumulatedText);
+                  if (hasText) {
+                    const elapsed = Date.now() - lastVisibleSendAt;
+                    if (elapsed < VISIBLE_STREAM_THROTTLE_MS) {
+                      if (!pendingVisibleTimer) {
+                        pendingVisibleTimer = setTimeout(async () => {
+                          pendingVisibleTimer = null;
+                          await sendVisibleUpdate();
+                        }, VISIBLE_STREAM_THROTTLE_MS - elapsed);
+                      }
+                      return;
+                    }
+                    await sendVisibleUpdate();
+                  }
+                }
+              },
+              onError: (error, info) => {
+                logger.error(`[WS] ${info.kind} reply failed: ${error.message}`);
+              },
+            },
+          });
+        },
+      );
+
+      const hasStartedStream = () => streamMessagesSent > 0 || Boolean(perfState.thinkingSentAt);
+      const passiveMarkdownCandidate = buildPassiveMarkdownReplyText(
+        state.accumulatedText,
+        state.replyMediaUrls,
+      );
+      const usePassiveMarkdown = state.forcePassiveMarkdown || shouldUsePassiveMarkdownReply(
+        passiveMarkdownCandidate,
+        state.replyMediaUrls,
+      );
+
+      // Flush the latest throttled snapshot before finish=true so reasoning
+      // and visible deltas are not collapsed away by the final frame. When an
+      // inline-image markdown reply has not started streaming yet, keep it
+      // atomic and send only the markdown reply below.
+      if (!usePassiveMarkdown) {
+        await flushPendingStreamUpdates();
+      }
+
+      // Cancel pending throttled timers before the final reply to prevent
+      // non-final updates from being sent after finish=true.
+      cancelPendingTimers();
+
+      try {
+        if (usePassiveMarkdown) {
+          await flushQueuedReplyMedia({
+            wsClient, frame, state, account, runtime, config,
+            agentId: route.agentId,
+          });
+
+          if (hasStartedStream()) {
+            const originalText = state.accumulatedText;
+            const originalReasoningText = state.reasoningText;
+            const hasForwardedVisibleText = Boolean(stripThinkTags(lastForwardedVisibleText).trim());
+
+            if (hasForwardedVisibleText) {
+              state.accumulatedText = "图文内容已生成，请查看下一条消息。";
+            } else {
+              state.accumulatedText = "";
+              state.reasoningText = state.reasoningText
+                || buildWaitingModelReasoningText(state.waitingModelSeconds || waitingModelSeconds);
+            }
+            await finishThinkingStream({
+              wsClient,
+              frame,
+              state,
+              accountId: account.accountId,
+            });
+            state.accumulatedText = originalText;
+            state.reasoningText = originalReasoningText;
+          }
+
+          let passiveMarkdownText = buildPassiveMarkdownReplyText(
+            state.accumulatedText,
+            state.replyMediaUrls,
+          );
+          if (state.hasMediaFailed && state.mediaErrorSummary) {
+            passiveMarkdownText = `${passiveMarkdownText}\n\n${state.mediaErrorSummary}`.trim();
+          }
+          await sendWsPassiveMarkdownReply({
+            wsClient,
+            frame,
+            text: passiveMarkdownText,
+            accountId: account.accountId,
+          });
+        } else {
+          await flushQueuedReplyMedia({
+            wsClient, frame, state, account, runtime, config,
+            agentId: route.agentId,
+          });
+          await finishThinkingStream({
+            wsClient,
+            frame,
+            state,
+            accountId: account.accountId,
+          });
+        }
+        perfState.finalReplySentAt = Date.now();
+        logPerf("final_reply_sent", {
+          textLength: state.accumulatedText.length,
+          hasMedia: state.hasMedia,
+          hasMediaFailed: state.hasMediaFailed,
+          deliveryMode: usePassiveMarkdown ? "passive_markdown" : "stream",
+        });
+        if (
+          account.sendThinkingMessage !== false &&
+          !perfState.firstReasoningReceivedAt &&
+          state.waitingModelSeconds > 0
+        ) {
+          logger.info(`[WS:${account.accountId}] No reasoning stream received for thinking placeholder`, {
+            sessionKey: ctxPayload.SessionKey ?? route.sessionKey,
+            reasoningLevel: sessionReasoningMeta?.reasoningLevel ?? null,
+            waitingModelSeconds: state.waitingModelSeconds,
+            visibleChars: stripThinkTags(state.accumulatedText).length,
+          });
+        }
+      } catch (sendError) {
+        logger.warn(`[WS] Final reply send failed, enqueuing for retry: ${sendError.message}`, {
+          accountId: account.accountId,
+          chatId,
+          senderId,
+        });
+        if (state.accumulatedText) {
+          enqueuePendingReply(account.accountId, {
+            text: state.accumulatedText,
+            senderId,
+            chatId,
+            isGroupChat,
+          });
+        }
+      }
+      safeCleanup();
+      logPerf("dispatch_complete", {
+        hadReasoning: Boolean(perfState.firstReasoningReceivedAt),
+        hadVisibleText: Boolean(perfState.firstVisibleReceivedAt),
+        totalOutputChars: state.accumulatedText.length,
+        replyMediaCount: state.replyMediaUrls.length,
+      });
+    } catch (error) {
+      logger.error(`[WS] Failed to dispatch reply: ${error.message}`);
+      logPerf("dispatch_failed", {
+        error: error.message,
+      });
+      try {
+        // Surface the error to the user; otherwise finishThinkingStream
+        // would close the stream silently with no visible content.
+        if (!stripThinkTags(state.accumulatedText) && !state.hasMedia) {
+          state.accumulatedText = `⚠️ 处理出错：${error.message}`;
+        }
+        await finishThinkingStream({
+          wsClient,
+          frame,
+          state,
+          accountId: account.accountId,
+        });
+      } catch (finishErr) {
+        logger.error(`[WS] Failed to finish thinking stream after dispatch error: ${finishErr.message}`);
+        if (state.accumulatedText) {
+          enqueuePendingReply(account.accountId, {
+            text: state.accumulatedText,
+            senderId,
+            chatId,
+            isGroupChat,
+          });
+        }
+      }
+      safeCleanup();
+    }
+  };
+
+  const lockKey = `${account.accountId}:${peerId}`;
+  const queuedAt = Date.now();
+  const previous = dispatchLocks.get(lockKey) ?? Promise.resolve();
+  const current = previous.then(
+    async () => {
+      const queueWaitMs = Date.now() - queuedAt;
+      if (queueWaitMs >= 50) {
+        logPerf("dispatch_lock_acquired", { queueWaitMs });
+      }
+      return await runDispatch();
+    },
+    async () => {
+      const queueWaitMs = Date.now() - queuedAt;
+      if (queueWaitMs >= 50) {
+        logPerf("dispatch_lock_acquired", { queueWaitMs, previousFailed: true });
+      }
+      return await runDispatch();
+    },
+  );
+  dispatchLocks.set(lockKey, current);
+  current.finally(() => {
+    if (dispatchLocks.get(lockKey) === current) {
+      dispatchLocks.delete(lockKey);
+    }
+  });
+}
+
+export async function startWsMonitor({ account, config, runtime, abortSignal, wsClientFactory }) {
+  if (!account.botId || !account.secret) {
+    throw new Error(`Missing botId or secret for account ${account.accountId}`);
+  }
+
+  setOpenclawConfig(config);
+  startMessageStateCleanup();
+
+  const wsClient =
+    typeof wsClientFactory === "function"
+      ? wsClientFactory({
+          account,
+          config,
+          runtime,
+          createSdkLogger,
+        })
+      : new WSClient({
+          botId: account.botId,
+          secret: account.secret,
+          wsUrl: account.websocketUrl,
+          logger: createSdkLogger(account.accountId),
+          heartbeatInterval: WS_HEARTBEAT_INTERVAL_MS,
+          maxReconnectAttempts: WS_MAX_RECONNECT_ATTEMPTS,
+        });
+
+  const reqIdStore = createPersistentReqIdStore(account.accountId);
+  await reqIdStore.warmup();
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const cleanup = async () => {
+      try {
+        await reqIdStore.flush();
+      } catch (flushErr) {
+        logger.warn(`[WS:${account.accountId}] Failed to flush reqId store on cleanup: ${flushErr.message}`);
+      }
+      reqIdStore.destroy();
+      await cleanupWsAccount(account.accountId);
+    };
+
+    const settle = async ({ error = null } = {}) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      await cleanup();
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    };
+
+    if (abortSignal?.aborted) {
+      void settle();
+      return;
+    }
+
+    if (abortSignal) {
+      abortSignal.addEventListener(
+        "abort",
+        async () => {
+          logger.info(`[WS:${account.accountId}] Abort signal received`);
+          await settle();
+        },
+        { once: true },
+      );
+    }
+
+    wsClient.on("connected", () => {
+      logger.info(`[WS:${account.accountId}] Connected`);
+    });
+
+    wsClient.on("authenticated", () => {
+      logger.info(`[WS:${account.accountId}] Authenticated`);
+      clearAccountDisplaced(account.accountId);
+      setWsClient(account.accountId, wsClient);
+
+      // Drain pending replies that failed due to prior WS disconnection.
+      if (account?.agentCredentials && hasPendingReplies(account.accountId)) {
+        void flushPendingRepliesViaAgentApi(account).catch((flushError) => {
+          logger.error(`[WS:${account.accountId}] Failed to flush pending replies: ${flushError.message}`);
+        });
+      }
+    });
+
+    wsClient.on("disconnected", (reason) => {
+      logger.info(`[WS:${account.accountId}] Disconnected: ${reason}`);
+    });
+
+    wsClient.on("reconnecting", (attempt) => {
+      logger.info(`[WS:${account.accountId}] Reconnecting attempt ${attempt}`);
+    });
+
+    wsClient.on("error", (error) => {
+      logger.error(`[WS:${account.accountId}] ${error.message}`);
+      if (error.message.includes("Authentication failed")) {
+        void settle({ error });
+      }
+    });
+
+    wsClient.on("message", async (frame) => {
+      try {
+        await withTimeout(
+          processWsMessage({ frame, account, config, runtime, wsClient, reqIdStore }),
+          MESSAGE_PROCESS_TIMEOUT_MS,
+          `Message processing timed out (msgId=${frame?.body?.msgid ?? "unknown"})`,
+        );
+      } catch (error) {
+        logger.error(`[WS:${account.accountId}] Failed to process inbound message: ${error.message}`);
+      }
+    });
+
+    wsClient.on("event.enter_chat", async (frame) => {
+      try {
+        await wsClient.replyWelcome(frame, {
+          msgtype: "text",
+          text: {
+            content: resolveWelcomeMessage(account),
+          },
+        });
+        recordOutboundActivity({ accountId: account.accountId });
+      } catch (error) {
+        logger.error(`[WS:${account.accountId}] Failed to send welcome reply: ${error.message}`);
+      }
+    });
+
+    wsClient.on("event.template_card_event", (frame) => {
+      logger.info(`[WS:${account.accountId}] Template card event received`, {
+        msgId: frame?.body?.msgid,
+        chatId: frame?.body?.chatid,
+        senderId: frame?.body?.from?.userid,
+        event: frame?.body?.event,
+      });
+    });
+
+    wsClient.on("event.feedback_event", (frame) => {
+      logger.info(`[WS:${account.accountId}] Feedback event received`, {
+        msgId: frame?.body?.msgid,
+        chatId: frame?.body?.chatid,
+        senderId: frame?.body?.from?.userid,
+        event: frame?.body?.event,
+      });
+    });
+
+    wsClient.on("event.disconnected_event", (frame) => {
+      const takeoverError = new Error(
+        `WeCom botId "${account.botId}" was taken over by another connection. Only one active connection per botId is allowed.`,
+      );
+      markAccountDisplaced({
+        accountId: account.accountId,
+        reason: takeoverError.message,
+      });
+      logger.error(`[WS:${account.accountId}] Received disconnected_event; stopping reconnects`, {
+        msgId: frame?.body?.msgid,
+        createTime: frame?.body?.create_time,
+        botId: account.botId,
+      });
+      try {
+        wsClient.disconnect();
+      } catch {
+        // Ignore secondary disconnect errors.
+      }
+      void settle({ error: takeoverError });
+    });
+
+    if (!settled) {
+      wsClient.connect();
+    }
+  });
+}
+
+export const wsMonitorTesting = {
+  buildWsStreamContent,
+  ensureDefaultSessionReasoningLevel,
+  resolveWsKeepaliveContent,
+  processWsMessage,
+  parseMessageContent,
+  splitReplyMediaFromText,
+  buildBodyForAgent,
+  buildWsActiveSendBody,
+  hasRemoteMarkdownImage,
+  extractRemoteMarkdownImageUrls,
+  resolveOutboundSenderLabel,
+  normalizeReplyMediaUrlForLoad,
+  flushPendingRepliesViaAgentApi,
+  stripThinkTags,
+  finishThinkingStream,
+};
+
+export { buildReplyMediaGuidance, ensureDefaultSessionReasoningLevel, normalizeReplyMediaUrlForLoad };
+
+// Shared internals used by callback-inbound.js
+export {
+  buildInboundContext,
+  resolveChannelCore,
+  normalizeReplyPayload,
+  resolveReplyMediaLocalRoots,
+};
