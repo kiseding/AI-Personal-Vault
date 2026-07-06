@@ -14,6 +14,7 @@ const runtimeState = {
 const SESSION_CHAT_INFO_MAX_SIZE = 5000;
 
 export const dispatchLocks = new Map();
+export const pendingDispatchBuffer = new Map();
 export const streamContext = new AsyncLocalStorage();
 
 export function setRuntime(runtime) {

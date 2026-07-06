@@ -51,7 +51,7 @@ import {
   recordOutboundActivity,
   recordPassiveReply,
 } from "./runtime-telemetry.js";
-import { dispatchLocks, getRuntime, setOpenclawConfig, setSessionChatInfo, streamContext } from "./state.js";
+import { dispatchLocks, pendingDispatchBuffer, getRuntime, setOpenclawConfig, setSessionChatInfo, streamContext } from "./state.js";
 import {
   cleanupWsAccount,
   deleteMessageState,
@@ -1884,7 +1884,7 @@ async function processWsMessage({
     return;
   }
 
-  const streamId = reqIdStore?.getSync(chatId) ?? generateReqId("stream");
+  let streamId = generateReqId("stream");
   if (reqIdStore) reqIdStore.set(chatId, streamId);
   const state = {
     accumulatedText: "",
@@ -2261,19 +2261,7 @@ async function processWsMessage({
   };
 
   if (account.sendThinkingMessage !== false) {
-    waitingModelActive = true;
-    waitingModelSeconds = 1;
-    state.waitingModelSeconds = waitingModelSeconds;
-    await sendThinkingReply({
-      wsClient,
-      frame,
-      streamId,
-      text: buildWaitingModelContent(waitingModelSeconds),
-    });
-    lastNonEmptyStreamText = buildWaitingModelContent(waitingModelSeconds);
-    perfState.thinkingSentAt = Date.now();
-    logPerf("thinking_sent", { streamId });
-    scheduleWaitingModelUpdate();
+    // Thinking placeholder will be sent inside runDispatch after lock is acquired
   }
   lastStreamSentAt = Date.now();
   scheduleKeepalive();
@@ -2315,7 +2303,7 @@ async function processWsMessage({
     route.agentId = dynamicAgentId;
   }
 
-  const { ctxPayload, storePath } = buildInboundContext({
+  let { ctxPayload, storePath } = buildInboundContext({
     runtime,
     config,
     account,
@@ -2342,6 +2330,8 @@ async function processWsMessage({
     channelTag: "WS",
   });
 
+  let thinkingSent = false;
+
   const runDispatch = async () => {
     let cleanedUp = false;
     const safeCleanup = () => {
@@ -2359,102 +2349,145 @@ async function processWsMessage({
         mediaCount: mediaList.length,
         ...sourceTiming,
       });
-      await streamContext.run(
-        { streamId, streamKey: peerId, agentId: route.agentId, accountId: account.accountId },
-        async () => {
-          await core.reply.dispatchReplyWithBufferedBlockDispatcher({
-            ctx: ctxPayload,
-            cfg: buildCfgForDispatch(config),
-            replyOptions: {
-              disableBlockStreaming: false,
-              onReasoningStream: async (payload) => {
-                const nextReasoning = normalizeReasoningStreamText(payload?.text);
-                if (!nextReasoning) {
-                  return;
-                }
-                stopWaitingModelUpdates();
-                state.reasoningText = nextReasoning;
-                if (!perfState.firstReasoningReceivedAt) {
-                  perfState.firstReasoningReceivedAt = Date.now();
-                  logPerf("first_reasoning_received", {
-                    chars: nextReasoning.length,
-                  });
-                }
 
-                // Throttle: skip if sent recently, schedule a trailing update instead.
-                const elapsed = Date.now() - lastReasoningSendAt;
-                if (elapsed < REASONING_STREAM_THROTTLE_MS) {
-                  if (!pendingReasoningTimer) {
-                    pendingReasoningTimer = setTimeout(async () => {
-                      pendingReasoningTimer = null;
-                      await sendReasoningUpdate();
-                    }, REASONING_STREAM_THROTTLE_MS - elapsed);
-                  }
-                  return;
-                }
-                await sendReasoningUpdate();
-              },
-            },
-            dispatcherOptions: {
-              deliver: async (payload, info) => {
-                state.deliverCalled = true;
-                const normalized = normalizeReplyPayload(payload);
-                const chunk = normalized.text;
-                const mediaUrls = normalized.mediaUrls;
+      let retries = 0;
+      const maxRetries = 6;
+      const baseDelayMs = 5000;
+      const maxDelayMs = 60000;
+      while (retries < maxRetries) {
+        try {
+          if (!thinkingSent && account.sendThinkingMessage !== false) {
+            waitingModelActive = true;
+            waitingModelSeconds = 1;
+            state.waitingModelSeconds = waitingModelSeconds;
+            await sendThinkingReply({
+              wsClient,
+              frame,
+              streamId,
+              text: buildWaitingModelContent(waitingModelSeconds),
+            });
+            lastNonEmptyStreamText = buildWaitingModelContent(waitingModelSeconds);
+            perfState.thinkingSentAt = Date.now();
+            logPerf("thinking_sent", { streamId });
+            scheduleWaitingModelUpdate();
+            thinkingSent = true;
+          } else if (thinkingSent && retries > 0) {
+            waitingModelActive = true;
+            waitingModelSeconds = 1;
+            state.waitingModelSeconds = waitingModelSeconds;
+            scheduleWaitingModelUpdate();
+          }
 
-                if (chunk) {
-                  stopWaitingModelUpdates();
-                  state.accumulatedText += chunk;
-                }
+          await streamContext.run(
+            { streamId, streamKey: peerId, agentId: route.agentId, accountId: account.accountId },
+            async () => {
+              await core.reply.dispatchReplyWithBufferedBlockDispatcher({
+                ctx: ctxPayload,
+                cfg: buildCfgForDispatch(config),
+                replyOptions: {
+                  disableBlockStreaming: false,
+                  onReasoningStream: async (payload) => {
+                    const nextReasoning = normalizeReasoningStreamText(payload?.text);
+                    if (!nextReasoning) {
+                      return;
+                    }
+                    stopWaitingModelUpdates();
+                    state.reasoningText = nextReasoning;
+                    if (!perfState.firstReasoningReceivedAt) {
+                      perfState.firstReasoningReceivedAt = Date.now();
+                      logPerf("first_reasoning_received", {
+                        chars: nextReasoning.length,
+                      });
+                    }
 
-                for (const mediaUrl of mediaUrls) {
-                  if (!state.replyMediaUrls.includes(mediaUrl)) {
-                    state.replyMediaUrls.push(mediaUrl);
-                    state.pendingMediaUrls.push(mediaUrl);
-                  }
-                }
-
-                const passiveMarkdownCandidate = buildPassiveMarkdownReplyText(
-                  state.accumulatedText,
-                  state.replyMediaUrls,
-                );
-                if (shouldUsePassiveMarkdownReply(passiveMarkdownCandidate, state.replyMediaUrls)) {
-                  state.forcePassiveMarkdown = true;
-                  cancelPendingTimers();
-                  return;
-                }
-
-                if (!perfState.firstVisibleReceivedAt && chunk?.trim()) {
-                  perfState.firstVisibleReceivedAt = Date.now();
-                  logPerf("first_visible_received", {
-                    chars: chunk.length,
-                  });
-                }
-
-                if (info.kind !== "final") {
-                  const hasText = stripThinkTags(state.accumulatedText);
-                  if (hasText) {
-                    const elapsed = Date.now() - lastVisibleSendAt;
-                    if (elapsed < VISIBLE_STREAM_THROTTLE_MS) {
-                      if (!pendingVisibleTimer) {
-                        pendingVisibleTimer = setTimeout(async () => {
-                          pendingVisibleTimer = null;
-                          await sendVisibleUpdate();
-                        }, VISIBLE_STREAM_THROTTLE_MS - elapsed);
+                    // Throttle: skip if sent recently, schedule a trailing update instead.
+                    const elapsed = Date.now() - lastReasoningSendAt;
+                    if (elapsed < REASONING_STREAM_THROTTLE_MS) {
+                      if (!pendingReasoningTimer) {
+                        pendingReasoningTimer = setTimeout(async () => {
+                          pendingReasoningTimer = null;
+                          await sendReasoningUpdate();
+                        }, REASONING_STREAM_THROTTLE_MS - elapsed);
                       }
                       return;
                     }
-                    await sendVisibleUpdate();
-                  }
-                }
-              },
-              onError: (error, info) => {
-                logger.error(`[WS] ${info.kind} reply failed: ${error.message}`);
-              },
+                    await sendReasoningUpdate();
+                  },
+                },
+                dispatcherOptions: {
+                  deliver: async (payload, info) => {
+                    state.deliverCalled = true;
+                    const normalized = normalizeReplyPayload(payload);
+                    const chunk = normalized.text;
+                    const mediaUrls = normalized.mediaUrls;
+
+                    if (chunk) {
+                      stopWaitingModelUpdates();
+                      state.accumulatedText += chunk;
+                    }
+
+                    for (const mediaUrl of mediaUrls) {
+                      if (!state.replyMediaUrls.includes(mediaUrl)) {
+                        state.replyMediaUrls.push(mediaUrl);
+                        state.pendingMediaUrls.push(mediaUrl);
+                      }
+                    }
+
+                    const passiveMarkdownCandidate = buildPassiveMarkdownReplyText(
+                      state.accumulatedText,
+                      state.replyMediaUrls,
+                    );
+                    if (shouldUsePassiveMarkdownReply(passiveMarkdownCandidate, state.replyMediaUrls)) {
+                      state.forcePassiveMarkdown = true;
+                      cancelPendingTimers();
+                      return;
+                    }
+
+                    if (!perfState.firstVisibleReceivedAt && chunk?.trim()) {
+                      perfState.firstVisibleReceivedAt = Date.now();
+                      logPerf("first_visible_received", {
+                        chars: chunk.length,
+                      });
+                    }
+
+                    if (info.kind !== "final") {
+                      const hasText = stripThinkTags(state.accumulatedText);
+                      if (hasText) {
+                        const elapsed = Date.now() - lastVisibleSendAt;
+                        if (elapsed < VISIBLE_STREAM_THROTTLE_MS) {
+                          if (!pendingVisibleTimer) {
+                            pendingVisibleTimer = setTimeout(async () => {
+                              pendingVisibleTimer = null;
+                              await sendVisibleUpdate();
+                            }, VISIBLE_STREAM_THROTTLE_MS - elapsed);
+                          }
+                          return;
+                        }
+                        await sendVisibleUpdate();
+                      }
+                    }
+                  },
+                  onError: (error, info) => {
+                    logger.error(`[WS] ${info.kind} reply failed: ${error.message}`);
+                  },
+                },
+              });
             },
-          });
-        },
-      );
+          );
+          break;
+        } catch (err) {
+          stopWaitingModelUpdates();
+          if (err.message.includes("session initialization conflicted") && retries < maxRetries - 1) {
+            retries++;
+            const exponent = Math.min(retries - 1, 8);
+            const delayMs = Math.min(maxDelayMs, baseDelayMs * 2 ** exponent);
+            logger.warn(`[WS] Session conflict, retrying in ${delayMs}ms (attempt ${retries}/${maxRetries})`);
+            await new Promise(r => setTimeout(r, delayMs));
+          } else {
+            throw err;
+          }
+        }
+      }
 
       const hasStartedStream = () => streamMessagesSent > 0 || Boolean(perfState.thinkingSentAt);
       const passiveMarkdownCandidate = buildPassiveMarkdownReplyText(
@@ -2606,30 +2639,114 @@ async function processWsMessage({
   };
 
   const lockKey = `${account.accountId}:${peerId}`;
-  const queuedAt = Date.now();
-  const previous = dispatchLocks.get(lockKey) ?? Promise.resolve();
-  const current = previous.then(
-    async () => {
-      const queueWaitMs = Date.now() - queuedAt;
-      if (queueWaitMs >= 50) {
-        logPerf("dispatch_lock_acquired", { queueWaitMs });
+
+  if (dispatchLocks.has(lockKey)) {
+    const existing = pendingDispatchBuffer.get(lockKey) || [];
+    existing.push({ text, mediaList, frame, messageId });
+    pendingDispatchBuffer.set(lockKey, existing);
+    logger.info(`[WS:${account.accountId}] Buffered message for merge`, { messageId, bufferedCount: existing.length });
+    return;
+  }
+
+  dispatchLocks.set(lockKey, true);
+
+  const dispatchOne = async (mergedText, mergedMediaList, mergedFrame, isMerged) => {
+    if (isMerged) {
+      const mergedRoute = core.routing.resolveAgentRoute({
+        cfg: config,
+        channel: CHANNEL_ID,
+        accountId: account.accountId,
+        peer: { kind: peerKind, id: peerId },
+      });
+      if (dynamicAgentId && !hasExplicitBinding) {
+        mergedRoute.sessionKey = mergedRoute.sessionKey.replace(`agent:${mergedRoute.agentId}:`, `agent:${dynamicAgentId}:`);
+        mergedRoute.agentId = dynamicAgentId;
       }
-      return await runDispatch();
-    },
-    async () => {
-      const queueWaitMs = Date.now() - queuedAt;
-      if (queueWaitMs >= 50) {
-        logPerf("dispatch_lock_acquired", { queueWaitMs, previousFailed: true });
-      }
-      return await runDispatch();
-    },
-  );
-  dispatchLocks.set(lockKey, current);
-  current.finally(() => {
-    if (dispatchLocks.get(lockKey) === current) {
-      dispatchLocks.delete(lockKey);
+      const rebuilt = buildInboundContext({
+        runtime,
+        config,
+        account,
+        frame: mergedFrame || frame,
+        body: mergedFrame?.body || body,
+        text: mergedText,
+        mediaList: mergedMediaList,
+        route: mergedRoute,
+        senderId,
+        chatId,
+        isGroupChat,
+      });
+      ctxPayload = rebuilt.ctxPayload;
     }
-  });
+
+    streamId = generateReqId("stream");
+    if (reqIdStore) reqIdStore.set(chatId, streamId);
+    state.streamId = streamId;
+    state.accumulatedText = "";
+    state.reasoningText = "";
+    state.replyMediaUrls = [];
+    state.pendingMediaUrls = [];
+    state.attachedReplyMediaUrls = [];
+    state.hasMedia = false;
+    state.hasImageMedia = false;
+    state.hasFileMedia = false;
+    state.hasMediaFailed = false;
+    state.mediaErrorSummary = "";
+    state.deliverCalled = false;
+    state.waitingModelSeconds = 0;
+    state.forcePassiveMarkdown = false;
+    state.streamCreatedAt = Date.now();
+    streamMessagesSent = 0;
+    lastReasoningSendAt = 0;
+    lastVisibleSendAt = 0;
+    lastStreamSentAt = Date.now();
+    lastNonEmptyStreamText = "";
+    lastForwardedVisibleText = "";
+    waitingModelActive = false;
+    waitingModelSeconds = 0;
+    thinkingSent = false;
+    perfState.firstReasoningReceivedAt = 0;
+    perfState.firstReasoningForwardedAt = 0;
+    perfState.firstVisibleReceivedAt = 0;
+    perfState.firstVisibleForwardedAt = 0;
+    perfState.thinkingSentAt = 0;
+    perfState.finalReplySentAt = 0;
+
+    const DISPATCH_TIMEOUT_MS = 15 * 60 * 1000;
+    let timeoutHandle;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutHandle = setTimeout(() => reject(new Error("dispatch timeout exceeded 15 minutes")), DISPATCH_TIMEOUT_MS);
+    });
+    try {
+      await Promise.race([runDispatch(), timeoutPromise]);
+    } finally {
+      clearTimeout(timeoutHandle);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+  };
+
+  try {
+    await dispatchOne(text, mediaList, frame, false);
+
+    while (true) {
+      const buffered = pendingDispatchBuffer.get(lockKey);
+      if (!buffered || buffered.length === 0) break;
+      pendingDispatchBuffer.delete(lockKey);
+
+      const mergedText = buffered.map((b) => b.text).filter(Boolean).join("\n---\n");
+      const mergedMediaList = buffered.flatMap((b) => b.mediaList || []);
+      const mergedFrame = buffered[buffered.length - 1].frame;
+
+      logger.info(`[WS:${account.accountId}] Flushing merged buffer`, {
+        count: buffered.length,
+        textLength: mergedText.length,
+        mediaCount: mergedMediaList.length,
+      });
+
+      await dispatchOne(mergedText, mergedMediaList, mergedFrame, true);
+    }
+  } finally {
+    dispatchLocks.delete(lockKey);
+  }
 }
 
 export async function startWsMonitor({ account, config, runtime, abortSignal, wsClientFactory }) {
