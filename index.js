@@ -83,6 +83,45 @@ const plugin = {
       }
       return { params };
     });
+
+    // One-time config sanity check on gateway start: emit actionable
+    // warnings when the recommended settings are missing so the user
+    // notices the gap before the first message arrives. The plugin does
+    // NOT auto-write to openclaw.json (avoids overwriting user choices
+    // and avoids touching a config file that's outside the plugin's
+    // directory). Run scripts/setup.sh to apply the defaults.
+    api.on("gateway_start", (_event, ctx) => {
+      const cfg = ctx?.config;
+      if (!cfg) return;
+      const wecom = cfg?.channels?.wecom;
+      const missing = [];
+      if (!wecom) missing.push("channels.wecom");
+      else {
+        if (!wecom.botId) missing.push("channels.wecom.botId");
+        if (!wecom.secret) missing.push("channels.wecom.secret");
+        if (wecom.dmPolicy && !["open", "allowlist", "pairing", "disabled"].includes(wecom.dmPolicy)) {
+          missing.push(`channels.wecom.dmPolicy (got "${wecom.dmPolicy}")`);
+        }
+        if (wecom.groupPolicy && !["open", "allowlist", "disabled"].includes(wecom.groupPolicy)) {
+          missing.push(`channels.wecom.groupPolicy (got "${wecom.groupPolicy}")`);
+        }
+      }
+      const toolProfile = cfg?.tools?.profile;
+      const thinkingDefault = cfg?.agents?.defaults?.thinkingDefault;
+      if (toolProfile && toolProfile !== "full" && toolProfile !== "coding" && toolProfile !== "minimal") {
+        missing.push(`tools.profile (got "${toolProfile}")`);
+      }
+      if (missing.length > 0) {
+        logger.warn(
+          `[wecom] setup is incomplete. Run \`bash scripts/setup.sh\` to write recommended defaults. Missing or unexpected: ${missing.join(", ")}`,
+        );
+      }
+      if (thinkingDefault && thinkingDefault !== "medium" && thinkingDefault !== "low" && thinkingDefault !== "high") {
+        logger.info(`[wecom] agents.defaults.thinkingDefault = "${thinkingDefault}" (medium is recommended for snappy replies)`);
+      } else {
+        logger.info(`[wecom] agents.defaults.thinkingDefault = "${thinkingDefault || "(unset)"}"`);
+      }
+    });
   },
 };
 

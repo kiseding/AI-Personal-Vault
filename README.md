@@ -94,6 +94,33 @@ openclaw plugins install @sunnoy/wecom
 
 > **从官方插件迁移：** 如果之前使用 `openclaw plugins install @wecom/wecom-openclaw-plugin`，请先卸载官方插件再安装本插件。`channels.wecom` 配置字段兼容，无需修改。
 
+### 首次配置（推荐）
+
+安装后运行交互式脚本写入 Bot 凭证与推荐配置：
+
+```bash
+# 在已安装的插件目录下运行
+bash scripts/setup.sh                  # 交互式输入 botId/secret
+bash scripts/setup.sh --bot-id <id> --secret <s>   # 非交互式
+bash scripts/setup.sh --reset-wecom    # 清空 channels.wecom 后重新写入
+```
+
+脚本会写入以下推荐配置（已有值不会被覆盖，除非使用 `--reset-wecom`）：
+
+- `channels.wecom.botId` / `channels.wecom.secret` — 你的机器人凭证
+- `channels.wecom.dmPolicy = "open"` / `groupPolicy = "open"` / `allowFrom = ["*"]`
+- `plugins.entries.wecom.enabled = true`
+- `agents.defaults.thinkingDefault = "medium"`（回复更敏捷）
+- `tools.profile = "full"`（解锁 `message` / `agents_list` / `gateway` / `nodes` / `tts` 工具）
+
+完成后重启 Gateway：
+
+```bash
+systemctl --user restart openclaw-gateway.service
+```
+
+Gateway 启动时，插件会检查配置完整性，缺失关键字段时会打印类似 `[wecom] setup is incomplete. Run \`bash scripts/setup.sh\` …` 的警告。
+
 ## 从 HTTP 回调迁移
 
 如果之前使用 HTTP 回调模式（Token + EncodingAESKey + 回调 URL），迁移步骤如下：
