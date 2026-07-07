@@ -430,14 +430,13 @@ function buildReplyMediaGuidance(config, agentId) {
     "CRITICAL: Do NOT echo raw browser host paths from browser tools directly in the final reply.",
     "If a browser tool returns MEDIA:/... or FILE:/... under that browser media directory, call stage_browser_media first.",
     "stage_browser_media copies the browser file into the current workspace and returns a safe /workspace/... directive for the final reply.",
-    "Do NOT use the message tool with action=\"send\" or action=\"sendAttachment\" to deliver files back to the current WeCom chat/user; use MEDIA: or FILE: directives instead.",
-    "CRITICAL: MEDIA: and FILE: directives MUST be placed INSIDE <final> tags. Directives placed outside <final> are silently discarded by the system and the file will never be sent.",
-    "For images: put each image path on its own line INSIDE <final> tags as MEDIA:/abs/path.",
+    "To deliver a file back to the current WeCom chat/user, prefer MEDIA: or FILE: directives. MEDIA: is for images; FILE: is for everything else (PDF, MD, DOC, DOCX, XLS, XLSX, CSV, ZIP, MP4, TXT, etc.).",
+    "CRITICAL: MEDIA: and FILE: directives MUST be placed INSIDE <final> tags, each on its own line. Directives placed outside <final> are silently discarded and the file will never be sent.",
+    "If a MEDIA: or FILE: directive fails to send (path truncated, file missing, permission denied, etc.), do NOT give up — retry on the next turn with a shorter or corrected path, or fall back to writing the content inline so the user can copy/screenshot it.",
+    "Never use MEDIA: for non-image files. PDF and other non-image files must always use FILE:.",
     "If a local file is in the current sandbox workspace, use its /workspace/... path directly.",
-    "For every non-image file (PDF, MD, DOC, DOCX, XLS, XLSX, CSV, ZIP, MP4, TXT, etc.): put it on its own line INSIDE <final> tags as FILE:/abs/path.",
-    "Example: <final>报告已生成，请查收。\\nFILE:/workspace/report.xlsx\\n</final> — or for a skill file: <final>\\nFILE:/workspace/skills/deep-research/SKILL.md\\n</final>",
-    "CRITICAL: Never use MEDIA: for non-image files. PDF must always use FILE:, never MEDIA:.",
-    "CRITICAL: If a tool already returned a path prefixed with FILE: (e.g. FILE:/abs/path.pdf), keep the FILE: prefix exactly as-is. Do NOT change it to MEDIA:.",
+    "Example: <final>报告已生成，请查收。\\nFILE:/workspace/report.xlsx\\n</final>",
+    "If the path is long, prefer an absolute short path under /workspace/... to avoid truncation.",
     "For public HTTPS images that should appear inline in the answer, keep them as markdown images like ![图片说明](https://example.com/image.png). Do NOT downgrade them to plain URLs.",
     "Each directive MUST be on its own line with no other text on that line.",
     "The plugin will automatically send the media to the user.",
@@ -2645,6 +2644,7 @@ async function processWsMessage({
     existing.push({ text, mediaList, frame, messageId });
     pendingDispatchBuffer.set(lockKey, existing);
     logger.info(`[WS:${account.accountId}] Buffered message for merge`, { messageId, bufferedCount: existing.length });
+    cancelPendingTimers();
     return;
   }
 
