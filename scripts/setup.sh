@@ -188,6 +188,27 @@ if wecom.get("groupPolicy") != "open":
     changed.append("channels.wecom.groupPolicy = open")
 wecom.setdefault("sendThinkingMessage", True)
 
+# mediaLocalRoots: allow the AI to send files that live in the
+# OpenClaw state directory (e.g. the inbound media folder) and the
+# per-agent workspace. Without these, MEDIA:/FILE: directives in the
+# AI's reply will be rejected with LocalMediaAccessError.
+# The default roots the OpenClaw core already adds are
+# {stateDir}/media, /agents, /workspace, /sandboxes. We only need to
+# add a workspace expansion for the active agent.
+import os
+state_dir = os.environ.get("HOME", "") + "/.openclaw"
+default_media_roots = [
+    state_dir + "/media",
+    state_dir + "/workspace",
+]
+existing_roots = wecom.get("mediaLocalRoots") or []
+merged_roots = list(dict.fromkeys([*existing_roots, *default_media_roots]))
+if merged_roots != existing_roots:
+    wecom["mediaLocalRoots"] = merged_roots
+    added = [r for r in merged_roots if r not in existing_roots]
+    for r in added:
+        changed.append(f"channels.wecom.mediaLocalRoots += {r}")
+
 cfg.setdefault("channels", {})["wecom"] = wecom
 
 # agents.defaults.thinkingDefault = medium (recommended for snappy replies)
