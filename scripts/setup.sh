@@ -12,21 +12,25 @@
 # overridden via flags.
 #
 # Usage:
-#   bash scripts/setup.sh                            # interactive
-#   bash scripts/setup.sh --bot-id <id> --secret <s> # non-interactive
-#   bash scripts/setup.sh --openclaw-config <path>   # custom config path
-#   bash scripts/setup.sh --reset-wecom             # clear wecom channel block
+#   bash scripts/setup.sh                                    # interactive (single-account)
+#   bash scripts/setup.sh --bot-id <id> --secret <s>         # non-interactive single-account
+#   bash scripts/setup.sh --account-name sales \
+#                            --bot-id <id> --secret <s>      # add a named account (multi-account mode)
+#   bash scripts/setup.sh --openclaw-config <path>           # custom config path
+#   bash scripts/setup.sh --reset-wecom                     # clear wecom channel block first
 
 set -euo pipefail
 
 CONFIG_PATH="${HOME}/.openclaw/openclaw.json"
 BOT_ID=""
 SECRET=""
+ACCOUNT_NAME=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bot-id)        BOT_ID="$2"; shift 2 ;;
     --secret)        SECRET="$2"; shift 2 ;;
+    --account-name)  ACCOUNT_NAME="$2"; shift 2 ;;
     --openclaw-config) CONFIG_PATH="$2"; shift 2 ;;
     --reset-wecom)   RESET_WECOM=1; shift ;;
     -h|--help)
@@ -66,10 +70,11 @@ if [[ -z "$BOT_ID" || -z "$SECRET" ]]; then
   exit 1
 fi
 
-python3 - "$CONFIG_PATH" "$BOT_ID" "$SECRET" "${RESET_WECOM:-0}" <<'PY'
+python3 - "$CONFIG_PATH" "$BOT_ID" "$SECRET" "${RESET_WECOM:-0}" "${ACCOUNT_NAME:-}" <<'PY'
 import json, sys, os
-cfg_path, bot_id, secret, reset = sys.argv[1:5]
+cfg_path, bot_id, secret, reset, account_name = sys.argv[1:6]
 reset = bool(int(reset))
+account_name = account_name.strip() or None
 
 with open(cfg_path, "r", encoding="utf-8") as f:
     raw = f.read()
@@ -105,35 +110,82 @@ if get_path(cfg, "plugins.entries.wecom.enabled") is not True:
     changed.append("plugins.entries.wecom.enabled = true")
 
 # channels.wecom — bot credentials and open access policies.
+# Supports two layouts:
+#   1) Single-account (legacy):
+#        channels.wecom = { botId, secret, dmPolicy, ... }
+#   2) Multi-account (preferred for >=2 bots):
+#        channels.wecom = { defaultAccount: "default",
+#                            default: { botId, secret, ... },
+#                            second:  { botId, secret, ... },
+#                            dmPolicy, groupPolicy, allowFrom (shared) }
+# We always migrate (1) -> (2) when adding a second account, so both bots
+# are addressable.
 wecom = cfg.get("channels", {}).get("wecom", {}) if isinstance(cfg.get("channels"), dict) else {}
 if reset:
     wecom = {}
     changed.append("channels.wecom reset")
 
 wecom.setdefault("enabled", True)
-if get_path(cfg, "channels.wecom.enabled") is not True:
+if wecom.get("enabled") is not True:
+    wecom["enabled"] = True
     changed.append("channels.wecom.enabled = true")
 
-if wecom.get("botId") != bot_id:
-    wecom["botId"] = bot_id
-    changed.append(f"channels.wecom.botId = {bot_id}")
+# Migrate legacy single-account layout -> multi-account, but only when
+# we are about to add a second bot (account_name explicitly provided).
+if account_name and wecom.get("botId") and wecom.get("secret") \
+        and not any(isinstance(v, dict) and v.get("botId") for v in wecom.values()):
+    legacy_bot = wecom.pop("botId")
+    legacy_secret = wecom.pop("secret")
+    default_block = {
+        "botId": legacy_bot,
+        "secret": legacy_secret,
+    }
+    # Preserve account-specific overrides that were at top level (e.g.
+    # allowFrom) by copying them into the default block.
+    for key in ("dmPolicy", "allowFrom", "groupPolicy", "groupChat",
+                "sendThinkingMessage", "workspaceTemplate", "agent"):
+        if key in wecom:
+            default_block[key] = wecom.pop(key)
+    wecom["default"] = default_block
+    wecom["defaultAccount"] = "default"
+    changed.append(
+        f"migrated legacy top-level botId/secret -> channels.wecom.default ({legacy_bot[:10]}…)"
+    )
 
-if wecom.get("secret") != secret:
-    wecom["secret"] = secret
-    changed.append("channels.wecom.secret = ***")
+target_account = account_name  # may be None for single-account mode
 
+if target_account:
+    # Multi-account mode.
+    block = wecom.get(target_account)
+    if not isinstance(block, dict):
+        block = {}
+        wecom[target_account] = block
+        changed.append(f"channels.wecom.{target_account} = {{}} (new)")
+    if block.get("botId") != bot_id:
+        block["botId"] = bot_id
+        changed.append(f"channels.wecom.{target_account}.botId = {bot_id}")
+    if block.get("secret") != secret:
+        block["secret"] = secret
+        changed.append(f"channels.wecom.{target_account}.secret = ***")
+else:
+    # Single-account mode: write to top level.
+    if wecom.get("botId") != bot_id:
+        wecom["botId"] = bot_id
+        changed.append(f"channels.wecom.botId = {bot_id}")
+    if wecom.get("secret") != secret:
+        wecom["secret"] = secret
+        changed.append("channels.wecom.secret = ***")
+
+# Shared defaults applied at top level (apply to all accounts).
 if wecom.get("dmPolicy") != "open":
     wecom["dmPolicy"] = "open"
     changed.append("channels.wecom.dmPolicy = open")
-
 if wecom.get("allowFrom") != ["*"]:
     wecom["allowFrom"] = ["*"]
     changed.append('channels.wecom.allowFrom = ["*"]')
-
 if wecom.get("groupPolicy") != "open":
     wecom["groupPolicy"] = "open"
     changed.append("channels.wecom.groupPolicy = open")
-
 wecom.setdefault("sendThinkingMessage", True)
 
 cfg.setdefault("channels", {})["wecom"] = wecom
